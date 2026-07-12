@@ -1,0 +1,505 @@
+# 自用功能扩展框架
+
+这个项目只按本机自用维护，不做 DLL 插件系统。后续新增功能统一放在 `work/fps-overlay-main/features/`，主程序只保留最少接入。
+
+## 核心文件
+
+- `features/FeatureContext.h`
+  - 主程序每帧生成的状态快照。
+  - Feature 只从这里读取 FPS、帧时间、CPU/GPU、显存、内存、前台窗口、游戏进程、电源状态和功率数据。
+- `features/Feature.h`
+  - 简单 Feature 接口：`name`、`enabled`、`Init`、`Update`、`DrawOverlay`、`DrawSettings`、`Shutdown`。
+- `features/FeatureRegistry.h/.cpp`
+  - 统一初始化、更新、绘制 Overlay、绘制设置页和退出清理。
+
+## 当前功能
+
+- `TemperatureAlertFeature`
+  - CPU/GPU 温度超过阈值时在 Overlay 显示提醒。
+- `LowFpsAlertFeature`
+  - FPS 低于阈值并持续几秒后显示提醒。
+- `GameAutoOverlayFeature`
+  - 检测到游戏启动时自动显示 Overlay，游戏退出后自动隐藏。
+- `LaptopPowerFeature`
+  - 显示插电状态、输入功率、电池充电/放电功率、估算整机功耗、CPU Package Power、GPU Power。
+  - 无法读取时显示 `N/A`，不会阻止程序启动。
+  - 不安装驱动，不强制管理员权限，不强制 PawnIO。
+
+## LaptopPowerFeature 数据来源
+
+按可用性尝试：
+
+- Windows Battery API / DeviceIoControl
+  - 枚举系统电池设备，读取 `IOCTL_BATTERY_QUERY_STATUS` 的 `Rate`。
+  - 用于电池充电功率和电池放电功率。
+- LibreHardwareMonitor
+  - 复用现有 LHWM 数据源，模糊匹配 CPU Package、GPU Power、Battery、Charge Rate、Discharge Rate、AC Adapter、Total System 等功率传感器。
+  - 用于 CPU/GPU 功耗、适配器输入功率、总系统功率等可用项。
+- ASUS / G-Helper / EC
+  - 当前不新增强制驱动和 ASUS 专用启动逻辑。
+  - 如果未来已有稳定只读接口，可以继续放进 `features/` 或现有传感器采集层。
+
+## 配置开关
+
+配置文件使用 `[Features]` 区域：
+
+```ini
+[Features]
+feature.temperature_alert=1
+feature.low_fps_alert=1
+feature.game_auto_overlay=0
+feature.laptop_power=1
+feature.laptop_power.show_overlay=1
+laptop_power.show_system_power=1
+laptop_power.show_known_components_power=1
+feature.laptop_power.show_estimated=1
+feature.laptop_power.show_source=1
+feature.laptop_power.sampling_ms=2000
+feature.laptop_power.smooth_seconds=5
+feature.laptop_power.warning_threshold_w=100
+feature.laptop_power.adapter_warning_w=65
+feature.laptop_power.display_mode=1
+```
+
+也可以在设置窗口的“自用功能”页面里直接开启/关闭。
+
+`laptop_power.show_system_power` 只控制 Overlay 中“整机 xxW / N/A”这一项，默认开启。关闭后自动功耗扫描和调试信息保持工作，“已知 xxW”等其他 LaptopPowerFeature 指标不受影响。
+
+`laptop_power.show_known_components_power` 只控制 Overlay 中“已知 xxW”这一项，默认开启。关闭后 CPU/GPU 功耗读取、整机功耗检测和设置页调试信息不受影响。
+
+## 如何新增一个 Feature
+
+1. 在 `work/fps-overlay-main/features/` 新建 `XXXFeature.h/.cpp`。
+2. 继承 `Feature`，实现 `name()`、`configKey()`、`Update()`、`DrawOverlay()`、`DrawSettings()`。
+3. 需要的数据从 `FeatureContext` 读取，不直接操作无关全局变量。
+4. 在 `FeatureRegistry.cpp` 里 `#include` 新文件，并在构造函数里 `push_back`。
+5. 如果需要保存配置，在 `FeatureSettings`、`LoadSettings()`、`GetSettings()` 和 `main.cpp` 的 `[Features]` 读写处加字段。
+6. 在 `FPSOverlay.vcxproj` 加入新的 `.cpp/.h`。
+7. 编译 Release，确认程序仍能启动。
+
+## main.cpp 接入口
+
+主程序只负责：
+
+- 启动时 `g_FeatureRegistry.Init()`。
+- 每帧填充 `FeatureContext`。
+- 每帧 `g_FeatureRegistry.Update(context)`。
+- Overlay 绘制末尾调用 `g_FeatureRegistry.DrawOverlay(context)`。
+- 设置页调用 `g_FeatureRegistry.DrawSettings(context)`。
+- 退出前 `g_FeatureRegistry.Shutdown()`。
+
+## LaptopPowerFeature 显示规则（2026-06-18）
+
+- 电池模式：
+  - Windows Battery API 的 Battery Discharge Rate 可用时，作为当前最可靠的整机功耗估算。
+  - `System Estimate = Battery Discharge Power`。
+  - 来源显示为“电池放电”。
+- 插电模式：
+  - 自动扫描 LibreHardwareMonitor 的全部 `Power` 类型传感器。
+  - 按 Total System、System、Platform、Board、EC、Adapter / AC / Input / Charger Power 的顺序匹配。
+  - 只有大于 1W 且小于 500W 的有效值会作为整机功耗。
+  - 没有匹配到有效传感器时显示“整机 N/A”。
+- CPU Package Power 与 GPU Power：
+  - 两者相加只显示为“已知”。
+  - 不会被标记为整机功耗。
+
+## Game++ 状态栏接入（2026-06-18）
+
+- LaptopPowerFeature 不再自行绘制 Overlay 面板。
+- Feature 只通过 `GetInlineOverlayMetrics()` 提供标签、数值和颜色类型。
+- `FeatureRegistry` 汇总内联指标。
+- 原有 Game++ `drawSeg()` 统一绘制功耗指标，因此字体、行高、背景、颜色和间距与 FPS、CPU、GPU、显存、内存一致。
+- 默认提供“整机 xxW/N/A”和“已知 xxW”两个分段。
+- “显示整机功耗”关闭后只移除“整机”分段，“已知”分段保持不变。
+- LaptopPowerFeature 的 `DrawOverlay()` 不再输出内容，因此不会出现左上角独立多行 Power 面板。
+
+## v1.10.0 中文化与自动功耗传感器
+
+- APP 用户界面固定使用简体中文。
+- 已汉化设置页、功能名称、按钮、复选框、下拉选项、提示语、错误弹窗、快捷键名称和 Overlay 普通状态词。
+- FPS、CPU、GPU、RPM、MHz、GB、Steam、PawnIO、LibreHardwareMonitor 等技术缩写或产品名称保留。
+- 中文字体继续优先加载：
+  - `C:\Windows\Fonts\msyh.ttc`
+  - `C:\Windows\Fonts\simhei.ttf`
+  - 找不到时回退系统字体或 ImGui 默认字体。
+- 启动时收集 LibreHardwareMonitor 暴露的全部 `Power` 类型传感器。
+- 程序自动选择最可能的整机功耗来源，不提供手动传感器选择。
+- “笔记本功耗”设置页提供简单实时信息和“重新扫描功耗传感器”按钮。
+- 自动匹配不会把 CPU Package、CPU Platform 或 GPU Package 当成整机功耗。
+- CPU/GPU 功耗仍只显示为“已知组件”。
+
+## AIDA64 整机与输入功耗回退
+
+- 当前 ASUS 机器的 LibreHardwareMonitor 只暴露 CPU/GPU 组件功耗，没有整机或适配器输入传感器。
+- 程序会自动读取 AIDA64 官方共享内存 `AIDA64_SensorValues`，无需手动选择传感器。
+- 输入功耗优先识别 `PDCIN`、DC Input、AC Input、Adapter、Charger 和 Power Supply。
+- 整机功耗优先识别 Total System、System、Platform、Board 和 EC Power。
+- 如果只有真实输入功耗：
+  - 电池正在充电时，`整机 = 输入功耗 - 电池充电功率`。
+  - 电池未充电时，`整机 = 输入功耗`。
+- Overlay 增加“输入 xxW / N/A”，继续使用现有 Game++ 横向分段样式。
+- AIDA64 需要运行并在“首选项 → 硬件监控 → 外部应用程序”启用共享内存。
+- AIDA64 不可用时静默回退到 LibreHardwareMonitor、ASUS 和 Windows Battery，不影响程序启动。
+- CPU+GPU 合计仍只叫“已知”，不会作为整机功耗来源。
+
+## 整机功耗独立显示开关
+
+- “自用功能”→“笔记本功耗”设置中提供“显示整机功耗”复选框。
+- 开启时 Overlay 继续显示“整机 xxW”或“整机 N/A”。
+- 关闭时 Overlay 不加入“整机”指标，但“已知 xxW”仍可正常显示。
+- 设置页继续显示自动整机功耗与自动来源，并标注“当前已隐藏悬浮窗显示”。
+- 配置保存在 `[Features]` 的 `laptop_power.show_system_power`，默认值为 `1`。
+
+## 已知组件功耗独立显示开关
+
+- “自用功能”→“笔记本功耗”设置中提供“显示已知组件功耗”复选框。
+- 开启时 Overlay 在 CPU/GPU 功耗可用时显示“已知 xxW”。
+- 关闭时 Overlay 不加入“已知”指标，但 CPU/GPU 功耗仍继续读取。
+- 设置页继续显示“已知组件功耗：xxW / N/A”作为调试信息。
+- 整机功耗检测及“整机”显示开关不受影响。
+- 配置保存在 `[Features]` 的 `laptop_power.show_known_components_power`，默认值为 `1`。
+# 最近收口
+
+- AIDA64 功耗读取现在仅访问 `AIDA64_SensorValues` 共享内存。程序不会结束或重启 AIDA64，也不会修改 `aida64.ini`。
+- 提供“允许估算整机功耗”开关，对应配置项 `laptop_power.allow_estimated_system_power`；传感器融合版本默认开启。
+- 开关关闭时，不使用 DC 输入扣除充电功率或 CPU/GPU 加平台补偿来生成整机估算；真实整机传感器、电池放电功率和已知组件功耗不受影响。
+- 开关开启时，允许显示带 `≈` 的整机估算，并标明估算来源。
+
+## 本机传感器融合估算
+
+- 没有真实整机表计时，可使用“允许估算整机功耗”生成 `整机 ≈xxW`。
+- 估算优先整合 CPU Package / Windows RAPL、CPU Memory、可用的 CPU Platform、独立显卡 Package Power。
+- 核显通常已包含在 CPU Package 中，不重复相加；CPU Cores、CPU Memory、CPU Platform 也按功耗域关系去重。
+- 未被功耗传感器覆盖的部分，使用实时风扇转速、NVMe 活动率、网络利用率、内存容量与占用进行动态补偿。
+- 额外计入主板、屏幕、控制器和供电转换损耗；设置页显示完整估算构成。
+- 该结果属于软件估算，不等同于适配器或主板电流表的实测值。
+- 新安装默认开启传感器融合估算，仍可通过 `laptop_power.allow_estimated_system_power=0` 关闭。
+
+### 枪神 9 Plus G815LR 专用模型
+
+- 自动识别 `ROG Strix G18 G815LR`，按本机实时传感器和分部件模型计算。
+- 无论界面当前选择核显还是独显，整机模型都会独立读取 RTX 5070 Ti Package Power。
+- BOE NE180QDM-NZC 屏幕功耗随 Windows 当前亮度动态变化。
+- 按本机 2×16GB DDR5-5600、SK hynix PC801 1TB、WD Blue SN570 1TB、Wi-Fi 7 BE200 和三风扇分别建模。
+- CPU Package、CPU Memory、CPU Platform和核显按功耗域去重。
+- CPU、GPU、核心联合功耗和最终整机功耗均不做上限截断；280W适配器参数只作为硬件背景，不参与限制结果。
+- 电池放电、真实 DC输入或真实整机传感器可自动校准融合模型偏差。
+- 设置页显示模型置信度、预计误差和逐部件估算构成。
+
+### G815LR 插座功耗实测校准（v1.10.13）
+
+- 根据 2026-06-23 的 15 组“软件融合估算 / 插座电力监测仪”配对数据建立插电专用校准。
+- 稳定低负载样本集中在 `75–80W → 114–116W`，稳定高负载样本集中在 `217–222W → 247–251W`。
+- 使用时间对齐后的鲁棒线性关系：`插座功耗 = 融合估算 × 1.0218875 + 25.8991W`。
+- 原始样本的平均绝对误差约为 `31W`；排除无法与相邻负载同时成立的 `240W → 208W` 时间错位样本后，校准平均绝对误差约为 `3W`。
+- `240W → 208W` 被视为负载切换期间软件平滑值与电力表瞬时值未对齐，不用于拉低整条单调功耗曲线。
+- 校准只用于 G815LR、交流供电、融合估算来源；真实输入功率、真实整机传感器和电池放电值保持原始测量。
+- 原有动态自校准继续存在，但改为学习插座实测曲线之后的剩余误差，避免重复叠加固定偏移。
+- 不设置功耗上限，超出当前样本区间时仍按线性关系外推，并通过预计误差提示不确定性。
+
+### 实测对比记录器（v1.10.14）
+
+- “提醒与功耗”页面新增“实测对比记录”区域，可开始或停止一次独立记录会话。
+- 开启后每 250ms 写入一条 CSV 样本，形成与电力检测仪视频对应的软件时间轴。
+- 每条记录包含本地时间（毫秒）、会话编号、经过时间、样本序号、整机估算、来源、置信度、预计误差、CPU Package、独显/GPU、AC 输入、电池充放电、FPS 和游戏状态。
+- CSV 使用 UTF-8 BOM，便于直接使用 Excel 或表格软件打开。
+- 文件保存到程序目录下的 `功耗实测对比记录` 文件夹，文件名包含开始记录的日期和时间。
+- 设置页实时显示记录编号、时长、样本数和当前整机估算，并提供“打开记录目录”按钮。
+- 记录功能为会话操作，不写入长期配置；程序退出时会刷新并安全关闭 CSV。
+- 建议拍摄开始时同时拍到设置页记录编号和电力检测仪，之后可只拍检测仪，以便精确对齐。
+
+### CSV Unicode 路径修正（v1.10.15）
+
+- 修复中文项目路径与中文记录目录经过 ANSI 接口后变成乱码的问题。
+- 原实现可能把目录分隔符破坏，使 CSV 以“乱码目录名 + 文件名”的形式落在发布目录根部。
+- 路径获取、目录创建、文件打开和打开目录操作全部改为 Windows Unicode 宽字符路径。
+- 记录目录改为稳定的英文 `PowerComparisonRecords`，避免受系统活动代码页影响。
+- CSV 文件继续使用 `power_comparison_日期-时间.csv`，内容仍为 UTF-8 BOM。
+- 设置页通过 UTF-8 转换显示完整路径；创建目录、创建文件或写入表头失败时显示具体错误信息。
+- 已产生的乱码目录和 CSV 不自动删除，防止丢失用户已有测试数据。
+
+### 实测记录传感器刷新修正（v1.10.16）
+
+- 修复设置中心打开时暂停重传感器，导致实测 CSV 重复写入开始记录前 CPU/GPU 缓存值的问题。
+- v1.10.16 已解决设置中心导致数值完全冻结的问题，但整套同步传感器查询仍会阻塞主线程，实机记录周期实际约为 2 秒。
+- 开始记录后的首轮会强制刷新 CPU/GPU 采集，减少第一条样本沿用旧缓存的概率。
+- CSV 新增 `raw_system_power_w`、`fusion_internal_w`、`fusion_outlet_calibrated_w` 三列。
+- `system_power_w` 继续表示最终平滑显示值；新增字段分别表示平滑前输出、固定插座校准前融合值和固定插座校准后融合值。
+- 这使后续分析可以分别判断模型曲线误差、固定校准误差与 5/10 秒平滑造成的相位延迟。
+- 本次提供的 v1.10.15 记录中 CPU Package 固定为 `60.139W`、独显固定为 `13.886W`，而视频电力表明显波动，因此该批数据不直接用于重新拟合线性公式。
+- 该节描述的是 v1.10.16 数据质量修复；实际交付校准已在 v1.10.18 更新。
+
+### 250ms 非阻塞记录时间轴（v1.10.17）
+
+- 功耗对比记录不再每 250ms 在主线程同步读取整套 LHWM、ASUS WMI、外部功耗与频率传感器。
+- CPU Package、CPU Memory/Platform、GPU/独显功耗及 LHWM 风扇值由独立后台快速采集任务更新。
+- 主线程只读取后台完成的最新完整快照，因此设置页绘制和 CSV 写入不会等待传感器调用返回。
+- CSV 继续每 250ms 写入一行；后台传感器耗时较长时允许复用最近一次完整快照，保证视频对齐时间轴连续。
+- 新增 `sensor_sample_sequence`：后台每完成一次完整功耗快照递增一次。
+- 新增 `sensor_sample_age_ms`：记录当前行所用功耗快照距采集完成时的年龄。
+- 拟合时应按样本序号识别重复快照，并结合样本年龄判断延迟；不能把重复行当作多次独立物理测量。
+- 退出程序时会等待正在执行的后台功耗采集收尾，避免卸载过程中仍访问 LHWM。
+
+### G815LR 新实测校准（v1.10.18）
+
+- 输入数据为 `power_comparison_20260623-161055.csv` 与对应 177.656 秒电力表视频。
+- CSV 共 713 条，持续 178.25 秒，采样间隔全部位于 250–266ms。
+- 根据负载爬升的对应关系，电力表画面与后台传感器快照的最佳补偿约为 1.5 秒。
+- 视频约 16–54 秒作为低负载稳态，约 76–168 秒作为高负载稳态。
+- 56–74 秒加载爬升、场景切换和结束下降阶段不加入直线拟合。
+- 旧公式在低负载稳态平均高估约 10.5W；新公式显著降低低负载偏差，并保持高负载误差水平。
+- 新公式为 `插座功耗 = 原融合估算 × 1.0218875 + 25.8991W`。
+- 总体稳态 MAE 由约 6.8W 降至约 4.9W；当前数据不支持增加复杂分段曲线。
+- 固定校准预计误差基线从 3W 调整为 5W，使置信区间与本轮实测残差一致。
+- 开始新记录时清空上一会话的传感器时间戳和序号；首个新快照完成前不写入陈旧的估算、CPU 或 GPU 数值。
+
+### 插电状态电池辅助供电监控
+
+- 新增“显示电池放电功耗”独立开关，配置项为 `laptop_power.show_battery_discharge_power`。
+- 插电状态不再屏蔽电池放电数据，可监控增强模式超过适配器供电能力时的电池补电行为。
+- 悬浮窗显示“电池放电 x.xW”；设置页检测到插电放电时标注“插电状态下电池辅助供电”。
+
+## 整体性能优化
+
+- 托盘“设置”命令改为消息处理后同帧执行，减少等待下一次 VSync 的延迟。
+- 隐藏覆盖层时改为消息可唤醒等待，点击托盘设置不再被固定休眠阻塞。
+- 打开设置时仅切换必要的穿透样式，不再触发全屏窗口框架重建和 TopMost 重排。
+- 屏幕亮度、前台窗口、内存状态和工作区尺寸均使用定时缓存，不再逐帧执行系统查询。
+- 普通覆盖层帧率适度降频；拖动和设置界面仍保持高响应刷新。
+- 中文字体图集从完整 CJK 集缩减为简体中文常用集，降低显存、内存和字体上传开销。
+
+## 显存与内存显示拆分
+
+- 显存可分别控制“百分比”和“已用 / 总量”。
+- 内存可分别控制“百分比”和“已用 / 总量”。
+- 四种显示均有独立开关，并适用于游戏加加、水平紧凑、Steam 和垂直布局。
+- 旧版 `showVRAM`、`showRAM` 配置会自动迁移；升级后默认保持原有的完整显示。
+
+## 功耗模型采样、校准与来源稳定性（2026-06-20）
+
+- 平滑和自校准只在 `feature.laptop_power.sampling_ms` 对应的模型采样点更新，不再逐渲染帧重复写入同一个传感器样本。
+- 5 秒 / 10 秒平滑改为按真实经过时间计算，并对大幅真实负载变化保留更快响应。
+- 插电和电池模式分别维护自校准偏移及平均残差，避免两种供电状态互相污染。
+- 自校准偏移不设置固定上下限；单次学习使用鲁棒步进抑制异常点，但可随有效样本持续收敛。
+- 插电整机功耗公式为 `DC 输入 + 电池辅助放电 - 电池充电`，增强模式下不再漏算电池补电部分。
+- 适配器、充电器和输入功率传感器只作为输入来源，不再被标记成真实整机功耗传感器。
+- 置信度会结合传感器覆盖、校准样本、平均残差和当前平滑过渡差值动态调整。
+- AIDA64 共享内存可用和失效会写入日志；日志每 60 秒或来源变化时记录一次功耗模型快照。
+- 诊断包增加当前输入、充放电、整机功耗、来源、置信度、误差和估算构成。
+- 未修改游戏加加横向布局；功耗项继续通过现有 `InlineOverlayMetric` 和 `drawSeg()` 接入。
+
+## 版本编号与构建时间
+
+- 版本号集中维护在 `src/version.h`，程序界面、配置、日志和 Windows 文件属性使用同一份版本信息。
+- 当前版本为 `v1.10.34 (2026-07-12 13:59)`。
+- 当前功能线每交付一次更新递增修订号。
+- 发布目录保留兼容名称 `overlay.exe`，同时生成带版本和时间的副本，例如 `overlay_v1.10.1_20260620-1925.exe`。
+
+## 托盘菜单失焦关闭修复（v1.10.6）
+
+- 托盘右键菜单弹出前将独立托盘 owner 窗口设为前台窗口。
+- 用户点击菜单外部且不选择任何命令时，Windows 可正常结束菜单跟踪并关闭菜单。
+- 保留独立托盘线程、现有菜单结构、功耗子菜单和命令转发逻辑。
+- 菜单关闭后继续发送 `WM_NULL`，符合 Win32 通知区弹出菜单的收尾模式。
+
+## 仅桌面显示（v1.10.7）
+
+- “控制与启动”页新增“仅桌面显示”开关，配置项为 `[Layout] desktopOnlyMode`，旧配置默认关闭。
+- 开启后每 200ms 检查前台窗口是否覆盖其所在显示器。
+- 检测到全屏或铺满显示器的应用时临时隐藏 Overlay；应用退出全屏、最小化或切回桌面后自动恢复。
+- 自动隐藏状态与用户手动显示状态分离，不会把用户主动隐藏的 Overlay 自动打开。
+- 打开设置面板时保持窗口可见，避免全屏状态下无法配置。
+- 支持多显示器，按前台应用所在显示器判断，不改变 Overlay 的游戏加加横向布局。
+
+### 最大化窗口检测修正（v1.10.8）
+
+- 除完整覆盖显示器的全屏应用外，也识别 Windows `IsZoomed` 最大化状态。
+- 增加显示器工作区 `rcWork` 覆盖判断，Edge、资源管理器等保留任务栏的普通最大化窗口也会隐藏 Overlay。
+- 保留显示器完整区域 `rcMonitor` 判断，继续支持浏览器 F11、视频全屏、游戏独占全屏和无边框全屏。
+
+## 桌面显示独立设置项（v1.10.10）
+
+- 设置侧边栏新增独立“桌面显示”页面，集中承载“仅桌面显示监测”开关、当前状态和行为说明。
+- 原“控制与启动”页继续只负责快捷键、Windows 自启动和程序启动行为。
+- 继续使用向后兼容的 `[Layout] desktopOnlyMode` 配置项，不迁移或重置用户已有设置。
+- 底层最大化、工作区覆盖和全屏检测逻辑保持不变。
+- 自动隐藏仍与用户手动显示/隐藏状态分离，设置面板打开时保持可见。
+- 仅调整设置入口，不修改任何监控项目、功耗功能、Overlay 配色和游戏加加横向布局。
+
+## 游戏优先的桌面显示判定（v1.10.11）
+
+- “仅桌面显示”不再把所有最大化或全屏窗口直接视为隐藏条件。
+- 前台游戏安装路径、常见游戏可执行文件特征属于强游戏证据；前台进程持续产生有效帧属于运行游戏证据。
+- 明确的浏览器、办公、聊天、启动器和媒体应用全屏时临时隐藏。
+- 未能立即确定类型的全屏程序进入识别缓冲期，期间保持 Overlay 可见，避免游戏启动或加载阶段被误隐藏。
+- 自动隐藏后仍持续更新前台 PID 和 ETW 帧数据；一旦确认游戏，会在检测周期内自动恢复 Overlay。
+- `FeatureContext::isInGame` 改为使用已确认的前台游戏状态，不再把任意普通前台进程误当成游戏。
+- 桌面显示页新增“正在识别”“已识别游戏”“普通应用已隐藏”等状态反馈，并显示当前前台程序。
+- 配置键、现有 UI 风格、游戏加加横向布局及全部监控功能保持兼容。
+
+### 窗口化全屏 / 无边框全屏显示修正（v1.10.25）
+
+- 强游戏目标、ETW 自动强游戏目标和近期强游戏保持状态统一写入独立的游戏 Overlay 显示状态。
+- “仅桌面显示”在全屏/最大化前台窗口中发现有效游戏目标时按游戏优先放行，不再只依赖前台 PID 本身。
+- 明确的普通桌面应用全屏或最大化时仍会清掉游戏 Overlay 显示状态，并按原规则临时隐藏。
+- 受保护游戏进程如果无法读取完整路径，但仍能读取 exe 名，也继续参与强游戏身份匹配。
+- 游戏显示状态下，透明 Win32 Overlay 宿主窗口切换到目标游戏窗口所在显示器的完整 `rcMonitor`，覆盖无边框全屏区域。
+- Overlay 可见且处于游戏显示状态时周期性调用 `SetWindowPos(HWND_TOPMOST, ...)` 重申顶层窗口和显示器尺寸；桌面状态下仍回到工作区，避免遮住任务栏。
+- 诊断摘要新增游戏显示目标、原因和宿主窗口矩形，便于判断“已经识别但被游戏/反作弊层级压住”和“没有识别到游戏”的区别。
+- 未使用注入、Hook 或反作弊高风险方案；如果游戏仍压制外部透明 Win32 Overlay，后续应评估 Xbox Game Bar Widget 等系统级显示通道。
+
+### 游戏 Owned Popup 显示路径（v1.10.26）
+
+- 游戏态找到目标进程最大可见顶层窗口后，Overlay popup 会临时把该游戏窗口设为 owner。
+- Owned popup 是普通 Win32 窗口关系，不注入游戏进程，也不 hook 渲染 API。
+- 游戏态继续使用目标游戏显示器完整 `rcMonitor`，并在可见游戏帧中高频重申 `HWND_TOPMOST`。
+- 离开游戏目标、普通桌面应用全屏/最大化触发隐藏、或打开实时设置页时，会解除 owner 绑定。
+- 日志新增 `Overlay owner updated` / `Overlay owner update failed`，`Overlay host updated` 也记录 owner 句柄。
+- 诊断摘要的 Overlay host rect 行新增 owner 字段，用于实机判断 owned-popup 路径是否生效。
+
+### 休眠唤醒与窗口生命周期修复（v1.10.28）
+
+- v1.10.26 的跨进程 Owned Popup 路径已停用。Windows 会在 owner 窗口销毁时连带销毁其 owned window，游戏退出、锁屏或休眠重建窗口后会导致 Overlay 主窗口消失，但进程和托盘线程仍继续运行。
+- 完整日志确认该故障后持续出现 `Overlay owner update failed ... err=1400`；`1400` 表示主窗口句柄已经失效。旧版累计产生超过 45 万条 owner 更新失败记录。
+- Overlay 不再把游戏、桌面或外壳进程窗口设为 owner，避免外部进程控制 Overlay 主窗口生命周期。
+- 窗口化全屏 / 无边框全屏仍使用目标显示器完整 `rcMonitor`，并继续重申 `HWND_TOPMOST`；没有改回工作区大小，也没有改变游戏优先识别规则。
+- 收到系统休眠通知时主动解除任何遗留 owner；唤醒后重新确认 `WS_EX_TOOLWINDOW`、清除 `WS_EX_APPWINDOW`，恢复穿透、不可激活和置顶状态，避免 Overlay 出现在任务栏。
+- 如果主窗口因系统或显卡窗口重建意外失效，主循环会重新创建透明宿主窗口和 DirectX/ImGui 后端，不再留下“进程仍在但点击无反应”的僵死状态。
+- 托盘线程响应电源恢复和 Explorer 的 `TaskbarCreated` 广播，重新发布通知区域图标。
+- Overlay 配色、指标顺序、游戏加加横向布局、七个设置页面和全部监控功能保持不变。
+
+### 游戏目标防误识别与低 FPS 计时修复（v1.10.29）
+
+- 游戏库目录不再单独构成桌面应用的强游戏证据。Wallpaper Engine、Steam/WeGame 辅助进程、Codex 和 ChatGPT 等明确桌面程序即使位于游戏库目录或持续产生图形呈现事件，也不会成为游戏 FPS 目标。
+- 最新实机日志曾确认 `wallpaper64.exe` 被误识别并使 Overlay 切换到完整显示器；现在会保留工作区大小和“仅桌面显示”行为。
+- 已确认游戏短暂失去前台时，资源管理器、启动器或聊天程序不会覆盖“最近游戏”PID；保持状态只刷新原已确认游戏。
+- 低 FPS 提醒的持续时间改为依据真实单调时钟，而不是游戏帧时间乘以 Overlay 刷新次数。休眠、唤醒或超过一秒的界面暂停会重置累积，避免提前或延后触发。
+- UI QA 输出文件名改为从 `src/version.h` 自动读取，版本号不再需要在脚本中手工维护。
+- 未改变游戏加加横向布局、指标顺序、Overlay 绘制、功耗模型或设置页面。
+
+### 休眠唤醒 NVIDIA 传感器稳定性修复（v1.10.30）
+
+- 已根据 Windows 事件日志修复 `overlay.exe` 在 `nvml.dll` 内发生访问冲突并退出的问题；该 DLL 由 LibreHardwareMonitor 用于读取 NVIDIA 传感器。
+- 所有 LibreHardwareMonitor 传感器读取现在经由单一串行入口执行，避免后台快照线程、主线程时钟读取和设置页读取并发进入 NVIDIA 驱动库。
+- 收到休眠通知时停止新的硬件读取；收到唤醒通知后延迟 15 秒再恢复，避免显卡驱动仍在重建设备时被访问。
+- 唤醒等待期间 Overlay 保持运行，传感器项暂时显示无有效新读数；不会在绘制路径或每帧执行文件 I/O。
+- Windows 自启动任务会校验实际任务 XML 中的可执行文件路径；发现仍指向旧归档版本时，会在下次以管理员权限启动当前程序后自动更新。
+- 未改变 Overlay 绘制、游戏加加横向布局、指标顺序、七个设置页面或游戏优先识别规则。
+
+### 稳定性与生命周期加固（v1.10.31）
+
+- LHWM 初始化、普通快照和功耗对比线程均改为可等待线程；程序退出前会完整回收，再释放 WMI、窗口和全局状态。
+- 每个传感器线程都在自身线程初始化并释放 COM，ASUS WMI 不再从未初始化 COM 的临时线程调用。
+- NVIDIA/LHWM 原生访问冲突增加窄范围 SEH 边界；发生异常后隔离本次 LHWM 会话并保留 Overlay 主程序及其他可用数据源。
+- 休眠通知只设置暂停状态并检查是否存在活动调用，不再在窗口消息线程无限等待；唤醒后的手动重扫同样遵守 15 秒冷却期。
+- LHWM 传感器路径、GPU 列表和频率选项在发布及读取时使用状态锁，避免后台重扫与设置/绘制并发访问。
+- DX11 `Present`、`ResizeBuffers`、后备缓冲和渲染目标创建均检查结果；设备丢失时停止绘制并循环重建，硬件设备暂不可用时可使用 WARP 保持程序可操作。
+- Overlay 宿主窗口或后端重建失败时按一秒间隔重试，不再直接结束整个程序。
+- Windows 电池设备查询和功耗 CSV 写入移至可等待后台线程，避免周期性驱动查询和磁盘刷新阻塞 Overlay 绘制。
+- 游戏自动悬浮窗只在进入游戏的状态边沿自动显示，并只恢复由该功能改变的隐藏状态，不再覆盖游戏中的手动隐藏选择。
+- `config.ini` 改为临时文件完整写入后原子替换；日志达到 16 MiB 后保留为 previous 日志并重新开始当前日志。
+- Release 和 QA 构建启用警告等级 4、严格一致性及私有 PDB，不改变发布目录所需运行文件。
+- 未改变七个设置页面、游戏加加横向布局、指标顺序、Overlay 配色或游戏优先识别规则。
+
+## 设置层级与托盘快捷开关（v1.10.12）
+
+- 控制中心顶部状态卡片根据当前字体行高动态计算高度，高 DPI 和大字体下不再与边框或下一行卡片重叠。
+- Overlay 内打开设置中心时，宿主窗口从始终置顶临时切换为普通窗口层级，可正常被其他应用窗口覆盖。
+- 关闭设置中心后恢复 Overlay 原有置顶和穿透行为，不改变游戏内悬浮显示。
+- 托盘图标右键菜单新增“仅桌面显示”勾选项，可直接开启或关闭 `[Layout] desktopOnlyMode`。
+- 托盘开关切换后立即保存，并与“桌面显示”设置页保持同步。
+- 游戏加加横向布局、监控指标和功耗功能未修改。
+
+## 设置界面美化与功能分区（v1.10.2）
+
+- 设置界面使用限定作用域的深色蓝灰主题，不改变 Overlay 本身的颜色、字体和布局。
+- 实时设置重新划分为“监控项目”“外观布局”“控制”“硬件”“提醒与功耗”五个标签页。
+- FPS、CPU、GPU、内存与存储、网络分别使用卡片和双列选项，减少连续堆叠和查找时间。
+- 布局、尺寸、透明度、位置、温度单位和游戏加加专属设置分区显示。
+- 硬件页增加传感器服务状态、CPU/GPU 摘要、GPU 选择以及独立诊断工具区。
+- 温度提醒、低帧率提醒、自动悬浮窗和笔记本功耗功能使用独立卡片。
+- 笔记本功耗设置拆分为悬浮窗显示、估算与提醒、实时状态和传感器工具。
+- 模型置信度使用进度条展示，实时功耗数据改为两列表格。
+- 完整启动设置页同步使用相同主题和卡片分区。
+- 游戏加加 Overlay 仍通过原有 `InlineOverlayMetric` 与 `drawSeg()` 绘制，横向布局未修改。
+
+## 开机自启动与科技主题（v1.10.3）
+
+- 新增“随 Windows 登录自动启动”开关，配置项为 `[App] startWithWindows`。
+- 自启动使用 Windows 任务计划程序，在当前用户登录后以最高权限启动，适配程序的管理员权限要求。
+- 任务允许在电池供电时启动，不会因从插电切换到电池而停止。
+- 开启开关时创建或更新 `FPS Overlay` 计划任务，并自动同步当前 `overlay.exe` 路径。
+- 关闭开关时删除计划任务；界面实时显示计划任务的实际状态和失败原因。
+- 旧版本曾无条件创建的计划任务会根据 `AutoLaunchTaskPath` 自动迁移为开启状态。
+- 新安装默认关闭开机自启动，不再隐式创建计划任务。
+- “启动时直接显示覆盖层”继续独立存在，只控制程序启动后显示 Overlay 还是完整设置页。
+- 设置页和完整配置页升级为深海军蓝底、霓虹青高亮、靛紫按压反馈的科技主题。
+- 卡片标题增加青色光条，标签选中增加青色顶线，滚动条和表头统一使用科技色调。
+- 游戏加加横向布局、指标顺序和告警颜色逻辑保持不变。
+
+## 参考式侧边栏与自由缩放（v1.10.4）
+
+- 启动设置页和 Overlay 内实时设置统一为左侧导航、右侧卡片内容的控制中心。
+- 功能分为“控制中心、监控项目、游戏内监控、控制与启动、硬件信息、提醒与功耗”六个区域。
+- 主窗口支持宽度和高度连续自由缩放，最小可用尺寸为 `720×520`，不再限制最大尺寸。
+- 窄窗口会自动压缩侧边栏宽度，内容卡片在双列和单列间响应式切换。
+- 启动 Overlay 的主操作固定放在侧边栏顶部，缩放后仍可直接访问。
+- 保留 GPU 选择、CPU/GPU 频率传感器来源、诊断包和 PawnIO 工具。
+- 设置窗口状态文字区分“尚未启动、已隐藏、运行中”，避免启动页误报 Overlay 正在显示。
+- 新增仅供界面验证构建使用的无硬件采集模式；正式 Release 不启用，不改变传感器逻辑。
+- 游戏加加横向布局、指标顺序、功耗项接入和告警颜色均未修改。
+
+## 年轻科技风监控驾驶舱（v1.10.5）
+
+- 设置界面从高饱和青色描边调整为石墨蓝黑分层表面，使用清亮天蓝、蓝紫和薄荷绿作为局部强调。
+- 左侧导航增加编号模块、双段选中指示和品牌化标题区，减少传统设置列表的老旧感。
+- 控制中心增加 Overlay、传感器、整机功耗和布局四项状态轨道，首屏可直接扫描关键状态。
+- 首页改为独立列堆叠的实时遥测、整机功耗、快捷控制和显示配置，修复双列表格造成的大块空白。
+- 卡片改用低对比度边界和色调层级，不再为每个区域使用高亮青色外框。
+- 页面标题增加 `SYSTEM / 编号` 导航标识和天蓝到蓝紫的细轨道，形成统一视觉记忆点。
+- 最小窗口下启用紧凑品牌区和单行导航，避免副标题与版本号截断。
+- 显示效果滑杆使用独立上方标签，避免全宽滑杆把标签挤出可视区域。
+- 设置界面启用 ImGui 键盘导航，并提供清晰的 Tab 焦点边框。
+- 只使用短促悬停与按压反馈，没有加入持续动画或额外纹理资源。
+- 游戏加加横向布局、Overlay 配色和指标绘制代码保持不变。
+<!-- 2026-06-28 v1.10.20: GPU monitoring now auto-prefers the telemetry-complete discrete GPU when the configured GPU lacks core temperature, VRAM, or power sensors. This preserves manual valid selections but repairs stale iGPU bindings. -->
+<!-- 2026-06-28 v1.10.21: Hardware monitoring keeps the same displayed metrics but normal LHWM reads now run asynchronously. External power-source priority is preserved so AIDA64/Windows Power Meter is not overwritten by delayed LHWM snapshots. -->
+<!-- 2026-06-29 v1.10.22: Desktop-only/game detection now supports borderless fullscreen games by preserving confirmed game targets across short launcher/overlay foreground changes. Known desktop apps remain excluded from FPS target selection unless they have strong game identity. -->
+<!-- 2026-06-29 v1.10.23: Game detection now prioritizes active ETW-present strong-game processes, improving Delta Force and borderless fullscreen behavior while continuing to block known desktop apps when they are fullscreen. -->
+<!-- 2026-06-29 v1.10.24: Protected or anti-cheat guarded game processes are now kept when OpenProcess returns access denied during recent-game and target-alive checks. This preserves the v1.10.23 Delta Force ETW target instead of clearing it because ACE blocks process queries. -->
+
+## 第一批实用监测功能（v1.10.32）
+
+- FPS 计数器新增“使用最近 60 秒平均 FPS”开关，新配置默认开启。
+- 平均 FPS 每秒最多采样一次，只保留 60 个内存样本，不写文件、不建立会话记录。
+- 游戏目标 PID 变更或清空时立即重置平均值，不会混入桌面或上一个游戏数据。
+- 低 FPS 提醒仍使用实时 FPS，不受平均值显示模式影响。
+- LHWM 完整快照成功发布时记录时间戳；数据年龄超过 `max(5000ms, 3 × 刷新周期)` 时，设置状态轨显示“数据延迟”。
+- 不会因为传感器暂时不可用而自动隐藏用户已选的 Overlay 指标，保持布局稳定。
+- 诊断包新增硬件传感器样本年龄，便于区分真实低负载与休眠/驱动恢复后的旧数据。
+- 托盘右键菜单新增“重新扫描传感器”，命令由主线程排队，实际 LHWM 初始化继续在后台线程运行。
+- 手动重扫可主动解除一次 LHWM 故障隔离状态并重新建立传感器映射，无需重启 FPS Overlay。
+- 游戏加加布局的分段数量、指标顺序和 `drawSeg()` 绘制样式保持不变；平均 FPS 只替换原 FPS 槽位中的数值。
+
+## 第二批实用监测功能（v1.10.33）
+
+- 新增“游戏实时峰值” Feature，记录当前游戏的 CPU/GPU 最高占用、最高温度和最高功耗。
+- 峰值数据只存在内存，不写入文件；目标 PID 切换、游戏退出或功能关闭时立即清零。
+- 峰值开关和当前数据放在现有 Feature 设置页，不向 Overlay 或游戏加加横条增加新分段。
+- FPS 新增可选自定义颜色阈值：低于警告阈值为红色，中间区间为黄色，达到良好阈值为绿色。
+- 自定义颜色默认关闭；关闭时 Steam/水平/垂直布局继续使用原 30/60 FPS 颜色规则，游戏加加 FPS 继续使用原绿色。
+- 启用自定义颜色后只改变 FPS 数值颜色，不改变标签、字体、分段宽度规则或指标顺序。
+- FeatureContext 新增 Windows 电池百分比、充电状态和游戏目标 PID，不新增驱动或网络请求。
+- 笔记本功耗设置新增“电池电量与供电状态”开关，默认关闭；开启后显示电量百分比以及充电/插电/电池供电状态。
+- 游戏加加布局中电池状态仅作为现有 Feature Inline Metric 的可选末尾项；关闭时与 v1.10.32 完全一致。
+
+## 第三批实用功能（v1.10.34）
+
+- 新增布局切换快捷键，默认为 `F9`，按“垂直排列→水平紧凑→Steam 风格栏→游戏加加风格”循环。
+- 快捷键复用现有录制控件，配置项为 `[Hotkeys] layoutSwitchKey`，切换后延迟原子保存。
+- 设置中心和托盘菜单新增“复制诊断摘要”，直接生成 Unicode 剪贴板文本，不写文件、不触发硬件重扫。
+- 诊断摘要包含版本、Overlay 状态、布局、目标 PID/进程、FPS/ETW、GPU 选择、LHWM 样本年龄、CPU/GPU 快照、整机功耗及恢复状态。
+- 休眠唤醒后新增轻量恢复状态机：首先显示“正在恢复监测”，首个新 LHWM 快照到达后显示“监测已恢复”。
+- 恢复超过 45 秒仍无新硬件快照时显示“恢复超时”，并引导使用托盘“重新扫描传感器”。
+- 恢复状态同时显示在托盘通知和设置状态轨；保留原 15 秒 NVIDIA/LHWM 恢复冷却，不提前访问驱动。
+- 本批不修改 Overlay 指标、游戏加加分段、绘制顺序或桌面优先判定。

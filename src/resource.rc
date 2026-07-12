@@ -1,0 +1,56 @@
+#pragma code_page(65001)
+
+// Application icon
+// IDI_ICON1 must be 1 to be the default app icon
+1 ICON "../icon.ico"
+
+// PawnIO setup executable (kernel driver installer for LibreHardwareMonitor)
+// Resource type RCDATA (raw binary data), ID 101
+101 RCDATA "../libs/lhwm/PawnIO_setup.exe"
+
+102 RCDATA "assets/github_icon.png"
+103 RCDATA "assets/kofi_icon.png"
+
+// Require administrator on every launch; ETW FPS capture and low-level hardware
+// monitoring need elevation on many systems.
+#if defined(FPSOVERLAY_UI_QA)
+1 24 "app_qa.manifest"
+#else
+1 24 "app.manifest"
+#endif
+
+// Version information
+#include <winver.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+PRODUCTVERSION  VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"  // Chinese (Simplified), Unicode
+        BEGIN
+            VALUE "CompanyName",      "Anees"
+            VALUE "FileDescription",  "FPS Overlay - 轻量游戏性能悬浮窗"
+            VALUE "FileVersion",      VER_NUMBER_STRING
+            VALUE "InternalName",     "FPSOverlay"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 FPS Overlay contributors. GPLv3."
+            VALUE "OriginalFilename", "overlay.exe"
+            VALUE "ProductName",      "FPS Overlay"
+            VALUE "ProductVersion",   VER_DISPLAY_STRING
+            VALUE "BuildDate",        VER_BUILD_DATE
+            VALUE "BuildTime",        VER_BUILD_TIME
+            VALUE "BuildStamp",       VER_BUILD_STAMP
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 0x04B0  // Chinese (Simplified), Unicode
+    END
+END

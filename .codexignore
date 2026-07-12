@@ -1,0 +1,12 @@
+build/
+libs/imgui/examples/
+libs/imgui/docs/
+screenshots/
+*.obj
+*.res
+*.exe
+!libs/lhwm/PawnIO_setup.exe
+*.pdb
+*.ilk
+*.dll.old
+README.md
