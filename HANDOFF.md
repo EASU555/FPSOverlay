@@ -4,8 +4,8 @@
 
 ## 当前交付状态
 
-- 当前版本：`v1.10.34`
-- 编译时间标识：`20260712-1359`
+- 当前版本：`v1.10.35`
+- 编译时间标识：`20260712-1828`
 - 项目根目录：`C:\Users\ROG\Desktop\FPSOverlay_完整项目`
 - 当前源码：`C:\Users\ROG\Desktop\FPSOverlay_完整项目\当前版本\源代码`
 - 当前发布程序：`C:\Users\ROG\Desktop\FPSOverlay_完整项目\当前版本\发布程序`
@@ -17,8 +17,9 @@
   - `overlay_v1.10.32_20260712-1249.exe`
   - `overlay_v1.10.33_20260712-1347.exe`
   - `overlay_v1.10.34_20260712-1359.exe`
-- 当前 `overlay.exe` SHA256：`A630DD13F0A1EB95B282D2BE076C89D31DB6332DBE125C12E413F7BDF654FF0A`
-- 最近归档：`旧版本归档\2026-07-12_1355_v1.10.33_第三批实用功能前`
+  - `overlay_v1.10.35_20260712-1828.exe`
+- 当前 `overlay.exe` SHA256：`2D2383ACD87B174552E8768B969B9D426379FE5017220B7CEA8015D7CBA44C0A`
+- 最近归档：`旧版本归档\2026-07-12_1823_v1.10.34_再次代码审查优化前`
 
 ## 新会话开始前必须检查
 
@@ -131,6 +132,12 @@
 
 ## 最近验证结果
 
+- `v1.10.35` Release 和 `FPSOVERLAY_UI_QA` 均以 `/W4 /permissive- /Zi` 无警告编译通过；Windows `FileVersion` 为 `1.10.35.0`，`ProductVersion` 为 `v1.10.35 (2026-07-12 18:28)`。
+- v1.10.35 游戏目标改为最终稳定后统一发布：未知前台程序不能直接抢占，已确认目标失证据保留 3 秒，不同目标需稳定 1.5 秒再切换；`KRSDKExternal`、崩溃报告器和常见 CEF 子进程已排除。
+- v1.10.35 托盘恢复优先修改现有图标，重新添加失败时按 1/3/8 秒重试；500ms 内重复的主窗口/托盘恢复消息会合并。
+- v1.10.35 传感器诊断改为 Unicode 路径和 UTF-8 BOM，写入前清除 LHWM 字符串中的内嵌 NUL；未启用的旧上游 WinHTTP 更新检查代码已删除。
+- v1.10.35 QA 合成休眠/唤醒后 4 个窗口全部响应，托盘只记录一次成功恢复，15000ms 冷却及随后恢复轮询均已确认。
+- 与 v1.10.34 归档逐字符比较，游戏加加主绘制块均为 12827 字符，SHA256 均为 `5BD6BB6A6901FEA9DB0AB16AA87DF6E18E012858F83765CA9907D94467DA8EC2`。
 - `v1.10.29` Release 和 `FPSOVERLAY_UI_QA` 均已成功编译。
 - `v1.10.30` Release 和 `FPSOVERLAY_UI_QA` 均已成功编译；QA 设置界面进程启动五秒后正常关闭，正式发布程序未在交付过程中启动。
 - `v1.10.31` Release 和 `FPSOVERLAY_UI_QA` 均以 `/W4 /permissive- /Zi` 无警告编译通过，并生成私有 PDB。
@@ -172,7 +179,7 @@
 - 七个设置页面、常用窗口尺寸和键盘焦点已完成代码与构建检查。
 - Windows 界面自动检查组件缺少内部模块，本轮未能抓取 QA 窗口截图；未改用正式程序代替。
 - 正式发布程序没有在交付过程中启动。
-- `FEATURES.md` 和 `TESTING.md` 已更新到 `v1.10.34`。
+- `FEATURES.md` 和 `TESTING.md` 已更新到 `v1.10.35`。
 
 `README.md` 在 `.codexignore` 中，因此本轮没有改写；以 `HANDOFF.md`、`FEATURES.md`、`TESTING.md` 和实际源码为准。
 <!-- 2026-06-28 v1.10.20: Fixed multi-GPU sensor binding. Stale Intel gpuCoreFreqPath can no longer force the overlay to monitor an iGPU when a discrete GPU has richer temperature/VRAM/power telemetry. Current release config is set to selectedGpu=1 and gpuCoreFreqPath=/gpu-nvidia/0/clock/0. -->

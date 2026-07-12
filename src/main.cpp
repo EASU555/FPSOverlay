@@ -26,7 +26,6 @@
 #include <psapi.h>
 #include <wbemidl.h>
 #include <comdef.h>
-#include <winhttp.h>
 #include <wincodec.h>
 #include <tlhelp32.h>
 #include <pdh.h>
@@ -50,9 +49,9 @@
 #include <algorithm>
 #include <utility>
 #include <fstream>
+#include <filesystem>
 #include <string>
 
-#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "PowrProf.lib")
@@ -83,7 +82,6 @@
 #define IDM_EXIT      1002
 #define IDM_SHOW      1003
 #define IDM_HIDE      1004
-#define IDM_UPDATE    1005
 #define IDM_RESET_POS 1006
 #define IDM_DESKTOP_ONLY 1007
 #define IDM_POWER_SHOW_SYSTEM 1010
@@ -1139,6 +1137,10 @@ static HWND           g_trayHwnd = nullptr;
 static NOTIFYICONDATAW g_nid     = {};
 static std::thread     g_trayThread;
 static HANDLE          g_trayReadyEvent = nullptr;
+static bool            g_trayIconPublished = false;
+static unsigned int    g_trayRestoreRetryIndex = 0;
+static ULONGLONG       g_trayLastRestoreTick = 0;
+static constexpr UINT_PTR kTrayRestoreTimerId = 0x4650;
 static std::atomic<bool> g_trayOverlayVisible{true};
 static RECT           g_overlayBounds = {0, 0, 0, 0};  // ImGui overlay bounds for hit-testing
 static RECT           g_liveSettingsBounds = {0, 0, 0, 0}; // Live settings window bounds for hit-testing
@@ -1148,89 +1150,6 @@ static bool           g_overlayForceCornerSnap = false; // one shot: snap to cor
 // ── Hardware info ──
 static char g_cpuName[256] = "Unknown";
 static char g_gpuName[256] = "Unknown";
-
-// ── Update checker state ──
-static std::atomic<bool> g_updateAvailable{false};
-static std::atomic<bool> g_updateCheckDone{false};
-static char g_latestVersion[32] = "";
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Update checker (checks GitHub releases API)
-// ═══════════════════════════════════════════════════════════════════════════
-[[maybe_unused]] static void CheckForUpdatesAsync()
-{
-    std::thread([]() {
-        HINTERNET hSession = WinHttpOpen(L"FPS-Overlay/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hSession) { g_updateCheckDone = true; return; }
-
-        HINTERNET hConnect = WinHttpConnect(hSession, L"api.github.com",
-            INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!hConnect) {
-            WinHttpCloseHandle(hSession);
-            g_updateCheckDone = true;
-            return;
-        }
-
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET",
-            L"/repos/aneeskhan47/fps-overlay/releases/latest",
-            nullptr, WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE);
-        if (!hRequest) {
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            g_updateCheckDone = true;
-            return;
-        }
-
-        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-            !WinHttpReceiveResponse(hRequest, nullptr)) {
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            g_updateCheckDone = true;
-            return;
-        }
-
-        // Read response
-        std::string response;
-        DWORD bytesRead = 0;
-        char buffer[4096];
-        while (WinHttpReadData(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            response += buffer;
-        }
-
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-
-        // Parse "tag_name" from JSON response (simple string search)
-        const char* tagKey = "\"tag_name\"";
-        size_t pos = response.find(tagKey);
-        if (pos != std::string::npos) {
-            pos = response.find(':', pos);
-            if (pos != std::string::npos) {
-                size_t start = response.find('"', pos + 1);
-                size_t end = response.find('"', start + 1);
-                if (start != std::string::npos && end != std::string::npos && end > start) {
-                    std::string latestTag = response.substr(start + 1, end - start - 1);
-                    snprintf(g_latestVersion, sizeof(g_latestVersion), "%s", latestTag.c_str());
-                    
-                    // Compare versions (simple string comparison)
-                    if (strcmp(g_latestVersion, APP_VERSION) != 0) {
-                        g_updateAvailable = true;
-                    }
-                }
-            }
-        }
-        g_updateCheckDone = true;
-    }).detach();
-}
 
 // ── GPU stats (from LHWM) ──
 static float g_gpuUsage = 0.0f;
@@ -2481,6 +2400,8 @@ static bool IsKnownDesktopProcess(const char* exeName)
         "steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe",
         "battle.net.exe", "riotclientservices.exe", "ubisoftconnect.exe",
         "eadesktop.exe", "wegame.exe", "browser.exe", "krwebview.exe",
+        "krsdkexternal.exe", "crashreportclient.exe",
+        "unrealcefsubprocess.exe", "cefsharp.browsersubprocess.exe",
         "clash-verge.exe", "clash-verge-service.exe", "baidunetdisk.exe",
         "leigod.exe", "ace-tray.exe", "ace-service.exe",
         "bilibili.exe", "potplayermini64.exe", "potplayermini.exe", "vlc.exe",
@@ -4341,25 +4262,37 @@ static void SortClockOptions()
 static void WriteSensorDiagnostics(
     const std::map<std::string, std::vector<std::tuple<std::string, std::string, std::string>>>& sensors)
 {
-    char exePath[MAX_PATH] = {};
-    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH))
+    wchar_t exePath[32768] = {};
+    const DWORD exeLength = GetModuleFileNameW(nullptr, exePath, ARRAYSIZE(exePath));
+    if (exeLength == 0 || exeLength >= ARRAYSIZE(exePath))
+        return;
+    const std::filesystem::path outputPath =
+        std::filesystem::path(exePath).parent_path() / L"sensor-diagnostics.txt";
+    if (outputPath.empty())
         return;
 
-    char* slash = strrchr(exePath, '\\');
-    if (!slash)
-        return;
-    *(slash + 1) = '\0';
-    strcat_s(exePath, MAX_PATH, "sensor-diagnostics.txt");
-
-    std::ofstream out(exePath, std::ios::out | std::ios::trunc);
+    std::ofstream out(outputPath,
+                      std::ios::out | std::ios::trunc | std::ios::binary);
     if (!out.is_open())
         return;
 
+    auto cleanField = [](const std::string& value) {
+        std::string clean(value.c_str());
+        std::replace(clean.begin(), clean.end(), '\t', ' ');
+        std::replace(clean.begin(), clean.end(), '\r', ' ');
+        std::replace(clean.begin(), clean.end(), '\n', ' ');
+        return clean;
+    };
+
+    out.write("\xEF\xBB\xBF", 3);
     out << "Hardware\tSensor\tType\tPath\n";
     for (const auto& [hardwareName, sensorList] : sensors) {
         for (const auto& sensorInfo : sensorList) {
             const auto& [sensorName, sensorType, sensorPath] = sensorInfo;
-            out << hardwareName << '\t' << sensorName << '\t' << sensorType << '\t' << sensorPath << '\n';
+            out << cleanField(hardwareName) << '\t'
+                << cleanField(sensorName) << '\t'
+                << cleanField(sensorType) << '\t'
+                << cleanField(sensorPath) << '\n';
         }
     }
 }
@@ -8620,9 +8553,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             g_Config.layoutStyle, g_Config.overlayScale);
     g_FeatureRegistry.Init();
 
-    // Local-only build: do not contact GitHub on startup.
-    g_updateCheckDone = true;
-
     // ── Show welcome message on first run ──
     MarkWelcomeShown();
 
@@ -8924,20 +8854,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
 
             const float headerButtonsBottom = headerY + headerButtonsH;
             float headerNextY = (titleRowBottom > headerButtonsBottom ? titleRowBottom : headerButtonsBottom) + 4.f;
-
-            if (g_updateAvailable) {
-                ImGui::SetCursorPosY(headerNextY);
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.2f,.9f,.4f,1));
-                if (ImGui::SmallButton("发现新版本！")) {
-                    ShellExecuteA(nullptr, "open",
-                        "https://github.com/aneeskhan47/fps-overlay/releases/latest",
-                        nullptr, nullptr, SW_SHOWNORMAL);
-                }
-                ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered())
-                    TooltipWrappedFmt("点击下载 %s", g_latestVersion);
-                headerNextY = ImGui::GetItemRectMax().y + 4.f;
-            }
 
             ImGui::SetCursorPosY(headerNextY);
             DrawDeveloperAttributionLine();
@@ -9328,40 +9244,41 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             // ── Update target PID (foreground window's process) ──
             DWORD currentPid = g_targetPid.load(std::memory_order_relaxed);
             static ULONGLONG s_lastForegroundPoll = 0;
+            static DWORD s_pendingTargetPid = 0;
+            static ULONGLONG s_pendingTargetSince = 0;
+            static ULONGLONG s_lastTargetEvidenceTick = 0;
             const ULONGLONG foregroundNow = GetTickCount64();
             if (foregroundNow - s_lastForegroundPoll >= 250) {
                 s_lastForegroundPoll = foregroundNow;
+                const DWORD previousTargetPid = currentPid;
                 HWND fg = GetForegroundWindow();
                 DWORD fgPid = 0;
                 bool foregroundBlocksGameTarget = false;
+                bool foregroundStrongGame = false;
+                bool foregroundKnownDesktop = false;
                 bool gameDisplayActive = false;
+                DWORD proposedPid = 0;
+                bool proposedImmediate = false;
+                const char* proposedReason = nullptr;
+                char proposedExe[320] = {};
                 if (fg && fg != g_hwnd) {
                     GetWindowThreadProcessId(fg, &fgPid);
                     if (IsLikelyGameForegroundWindow(fg, fgPid)) {
                         char fgExe[320] = {};
                         char fgPath[1024] = {};
                         GetProcessIdentity(fgPid, fgExe, sizeof(fgExe), fgPath, sizeof(fgPath));
-                        const bool foregroundStrongGame = HasStrongGameIdentity(fgExe, fgPath);
-                        const bool foregroundKnownDesktop = IsKnownDesktopProcess(fgExe);
+                        foregroundStrongGame = HasStrongGameIdentity(fgExe, fgPath);
+                        foregroundKnownDesktop = IsKnownDesktopProcess(fgExe);
                         foregroundBlocksGameTarget =
                             fgExe[0] && foregroundKnownDesktop && !foregroundStrongGame &&
                             IsWindowMaximizedOrFullscreen(fg);
-                        if (fgExe[0] && (foregroundStrongGame || !foregroundKnownDesktop)) {
-                            currentPid = fgPid;
-                            g_targetPid.store(currentPid, std::memory_order_relaxed);
-                            if (foregroundStrongGame) {
-                                RememberRecentGame(fgPid, fgExe);
-                                RememberGameOverlayDisplay(fgPid, "foreground strong game");
-                                gameDisplayActive = true;
-                            }
-                        } else {
-                            currentPid = 0;
+                        if (foregroundStrongGame) {
+                            proposedPid = fgPid;
+                            proposedImmediate = true;
+                            proposedReason = "foreground strong game";
+                            snprintf(proposedExe, sizeof(proposedExe), "%s", fgExe);
                         }
-                    } else {
-                        currentPid = 0;
                     }
-                } else if (!g_ShowLiveSettings) {
-                    currentPid = 0;
                 }
 
                 const DWORD autoPid = g_autoTargetPid.load(std::memory_order_relaxed);
@@ -9371,28 +9288,85 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                     !foregroundBlocksGameTarget &&
                     autoPid != 0 && autoFps >= 12.0f &&
                     IsStrongGameProcess(autoPid, autoExe, sizeof(autoExe));
-                if (autoStrongGame) {
-                    currentPid = autoPid;
-                    g_targetPid.store(currentPid, std::memory_order_relaxed);
-                    RememberRecentGame(autoPid, autoExe);
-                    RememberGameOverlayDisplay(autoPid, "active ETW game target");
-                    gameDisplayActive = true;
+                const bool sustainedUnknownForeground =
+                    !foregroundBlocksGameTarget && !foregroundKnownDesktop &&
+                    fgPid != 0 && autoPid == fgPid && autoFps >= 20.0f;
+                if (proposedPid == 0 && (autoStrongGame || sustainedUnknownForeground)) {
+                    proposedPid = autoPid;
+                    proposedImmediate = autoStrongGame;
+                    proposedReason = autoStrongGame
+                        ? "active ETW game target"
+                        : "sustained foreground ETW target";
+                    if (autoExe[0])
+                        snprintf(proposedExe, sizeof(proposedExe), "%s", autoExe);
                 }
 
-                if (currentPid == 0 && !foregroundBlocksGameTarget &&
+                if (proposedPid == 0 && !foregroundBlocksGameTarget &&
                     RecentGameStillUsable(foregroundNow, 120000)) {
                     const float directFps = g_gameFps.load(std::memory_order_relaxed);
                     if (autoPid == g_RecentGamePid || autoFps >= 12.0f || directFps >= 1.0f) {
-                        currentPid = g_RecentGamePid;
-                        g_targetPid.store(currentPid, std::memory_order_relaxed);
-                        RefreshRecentGame(currentPid);
-                        RememberGameOverlayDisplay(currentPid, "recent game target hold");
-                        gameDisplayActive = true;
+                        proposedPid = g_RecentGamePid;
+                        proposedReason = "recent game target hold";
                     }
                 }
 
-                if (currentPid == 0)
-                    g_targetPid.store(0, std::memory_order_relaxed);
+                const float directFps = g_gameFps.load(std::memory_order_relaxed);
+                if (previousTargetPid != 0 && directFps >= 1.0f)
+                    s_lastTargetEvidenceTick = foregroundNow;
+
+                if (foregroundBlocksGameTarget) {
+                    currentPid = 0;
+                    s_pendingTargetPid = 0;
+                    s_pendingTargetSince = 0;
+                } else if (proposedPid == previousTargetPid && proposedPid != 0) {
+                    currentPid = proposedPid;
+                    s_lastTargetEvidenceTick = foregroundNow;
+                    s_pendingTargetPid = 0;
+                    s_pendingTargetSince = 0;
+                } else if (previousTargetPid == 0 && proposedPid != 0 && proposedImmediate) {
+                    currentPid = proposedPid;
+                    s_lastTargetEvidenceTick = foregroundNow;
+                    s_pendingTargetPid = 0;
+                    s_pendingTargetSince = 0;
+                } else if (proposedPid != 0 && proposedPid != previousTargetPid) {
+                    if (s_pendingTargetPid != proposedPid) {
+                        s_pendingTargetPid = proposedPid;
+                        s_pendingTargetSince = foregroundNow;
+                    }
+                    const ULONGLONG requiredStableMs = previousTargetPid == 0 ? 1000 : 1500;
+                    if (foregroundNow - s_pendingTargetSince >= requiredStableMs) {
+                        currentPid = proposedPid;
+                        s_lastTargetEvidenceTick = foregroundNow;
+                        s_pendingTargetPid = 0;
+                        s_pendingTargetSince = 0;
+                    } else {
+                        currentPid = previousTargetPid;
+                    }
+                } else if (previousTargetPid != 0 &&
+                           IsProcessAlive(previousTargetPid) &&
+                           s_lastTargetEvidenceTick != 0 &&
+                           foregroundNow - s_lastTargetEvidenceTick < 3000) {
+                    currentPid = previousTargetPid;
+                } else {
+                    currentPid = 0;
+                    s_pendingTargetPid = 0;
+                    s_pendingTargetSince = 0;
+                }
+
+                g_targetPid.store(currentPid, std::memory_order_relaxed);
+                if (currentPid != 0 && currentPid == proposedPid) {
+                    if (proposedExe[0])
+                        RememberRecentGame(currentPid, proposedExe);
+                    else
+                        RefreshRecentGame(currentPid);
+                    RememberGameOverlayDisplay(
+                        currentPid, proposedReason ? proposedReason : "stable game target");
+                    gameDisplayActive = true;
+                } else if (currentPid != 0 &&
+                           g_GameOverlayDisplayActive &&
+                           g_GameOverlayDisplayPid == currentPid) {
+                    gameDisplayActive = true;
+                }
                 if (foregroundBlocksGameTarget || !gameDisplayActive)
                     ClearGameOverlayDisplay();
 
@@ -9533,12 +9507,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                     }
                     lastGpuTime = now;
                     
-                    // Update tray tooltip if update check completed
-                    static bool tooltipUpdated = false;
-                    if (g_updateCheckDone && !tooltipUpdated) {
-                        UpdateTrayTooltip();
-                        tooltipUpdated = true;
-                    }
                 }
 
                 // ── RAM ──
@@ -10977,13 +10945,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             StartSettingsTrace("tray");
             POINT pt; GetCursorPos(&pt);
             HMENU m = CreatePopupMenu();
-            // Show update option if available
-            if (g_updateAvailable) {
-                wchar_t updateText[96];
-                _snwprintf_s(updateText, _TRUNCATE, L"下载更新 (%S)", g_latestVersion);
-                AppendMenuW(m, MF_STRING, IDM_UPDATE, updateText);
-                AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            }
             // Show/Hide toggle based on current visibility
             if (g_OvlVisible)
                 AppendMenuW(m, MF_STRING, IDM_HIDE, L"隐藏覆盖层");
@@ -11009,11 +10970,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PostMessageW(hWnd, WM_NULL, 0, 0);
             // Handle the command directly
             switch (cmd) {
-                case IDM_UPDATE:
-                    ShellExecuteA(nullptr, "open", 
-                        "https://github.com/aneeskhan47/fps-overlay/releases/latest",
-                        nullptr, nullptr, SW_SHOWNORMAL);
-                    break;
                 case IDM_SHOW:     g_OvlVisible = true;            break;
                 case IDM_HIDE:     g_OvlVisible = false;           break;
                 case IDM_DESKTOP_ONLY:
@@ -11083,11 +11039,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 break;
             case IDM_SETTINGS: QueueShowSettings();            break;
             case IDM_EXIT:     g_Pending = CMD_EXIT;           break;
-            case IDM_UPDATE:
-                ShellExecuteA(nullptr, "open",
-                    "https://github.com/aneeskhan47/fps-overlay/releases/latest",
-                    nullptr, nullptr, SW_SHOWNORMAL);
-                break;
             case IDM_POWER_SHOW_SYSTEM:
                 g_FeatureRegistry.ToggleLaptopPowerQuickOption(
                     LaptopPowerQuickOption::ShowSystemPower);
@@ -11132,19 +11083,62 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-static void PublishTrayIcon(bool replaceExisting)
+static bool PublishTrayIcon(bool replaceExisting)
 {
     if (!g_nid.hWnd)
-        return;
-    if (replaceExisting)
+        return false;
+
+    if (replaceExisting && g_trayIconPublished &&
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
+        return true;
+    }
+    if (replaceExisting && g_trayIconPublished)
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
     if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
+        g_trayIconPublished = true;
         g_nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+        return true;
     } else {
+        g_trayIconPublished = false;
         LogLine("Tray icon publish failed: replace=%d err=%lu",
                 replaceExisting ? 1 : 0,
                 (unsigned long)GetLastError());
+        return false;
+    }
+}
+
+static void ScheduleTrayRestoreRetry(HWND hWnd)
+{
+    static constexpr UINT retryDelaysMs[] = {1000, 3000, 8000};
+    if (!hWnd || g_trayRestoreRetryIndex >= ARRAYSIZE(retryDelaysMs)) {
+        LogLine("Tray icon restore retries exhausted");
+        return;
+    }
+    const UINT delay = retryDelaysMs[g_trayRestoreRetryIndex++];
+    SetTimer(hWnd, kTrayRestoreTimerId, delay, nullptr);
+    LogLine("Tray icon restore retry scheduled: attempt=%u delay=%u ms",
+            g_trayRestoreRetryIndex, delay);
+}
+
+static void RestoreTrayIcon(HWND hWnd, bool explorerRestarted)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (!explorerRestarted && g_trayIconPublished &&
+        g_trayRestoreRetryIndex == 0 && g_trayLastRestoreTick != 0 &&
+        now - g_trayLastRestoreTick < 500) {
+        return;
+    }
+    KillTimer(hWnd, kTrayRestoreTimerId);
+    if (explorerRestarted)
+        g_trayIconPublished = false;
+    if (PublishTrayIcon(!explorerRestarted)) {
+        g_trayRestoreRetryIndex = 0;
+        g_trayLastRestoreTick = now;
+        LogLine("Tray icon restored: explorerRestarted=%d",
+                explorerRestarted ? 1 : 0);
+    } else {
+        ScheduleTrayRestoreRetry(hWnd);
     }
 }
 
@@ -11156,7 +11150,8 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     if (g_TaskbarCreatedMessage != 0 &&
         msg == g_TaskbarCreatedMessage) {
-        PublishTrayIcon(true);
+        g_trayRestoreRetryIndex = 0;
+        RestoreTrayIcon(hWnd, true);
         return 0;
     }
 
@@ -11172,12 +11167,6 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             POINT pt{};
             GetCursorPos(&pt);
             HMENU menu = CreatePopupMenu();
-            if (g_updateAvailable.load(std::memory_order_relaxed)) {
-                wchar_t updateText[96];
-                _snwprintf_s(updateText, _TRUNCATE, L"下载更新 (%S)", g_latestVersion);
-                AppendMenuW(menu, MF_STRING, IDM_UPDATE, updateText);
-                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            }
             if (g_trayOverlayVisible.load(std::memory_order_relaxed))
                 AppendMenuW(menu, MF_STRING, IDM_HIDE, L"隐藏覆盖层");
             else
@@ -11237,11 +11226,7 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             menuVisibleUs = PerfNowUs();
         return 0;
     case WM_APP_TRAY_TOOLTIP:
-        if (g_updateAvailable.load(std::memory_order_relaxed))
-            _snwprintf_s(g_nid.szTip, _TRUNCATE,
-                         L"FPS Overlay - 有可用更新！(%S)", g_latestVersion);
-        else
-            lstrcpyW(g_nid.szTip, L"FPS Overlay");
+        lstrcpyW(g_nid.szTip, L"FPS Overlay");
         Shell_NotifyIconW(NIM_MODIFY, &g_nid);
         return 0;
     case WM_APP_TRAY_RECOVERY_STATUS:
@@ -11271,8 +11256,21 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
     case WM_APP_TRAY_RESTORE:
-        PublishTrayIcon(true);
+        g_trayRestoreRetryIndex = 0;
+        RestoreTrayIcon(hWnd, false);
         return 0;
+    case WM_TIMER:
+        if (wParam == kTrayRestoreTimerId) {
+            KillTimer(hWnd, kTrayRestoreTimerId);
+            if (PublishTrayIcon(false)) {
+                g_trayRestoreRetryIndex = 0;
+                LogLine("Tray icon restored by retry");
+            } else {
+                ScheduleTrayRestoreRetry(hWnd);
+            }
+            return 0;
+        }
+        break;
     case WM_POWERBROADCAST:
         if (wParam == PBT_APMRESUMEAUTOMATIC ||
             wParam == PBT_APMRESUMECRITICAL ||
@@ -11284,6 +11282,8 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         DestroyWindow(hWnd);
         return 0;
     case WM_DESTROY:
+        KillTimer(hWnd, kTrayRestoreTimerId);
+        g_trayIconPublished = false;
         PostQuitMessage(0);
         return 0;
     }
@@ -11314,7 +11314,8 @@ static void TrayThreadMain()
         if (!g_nid.hIcon)
             g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
         lstrcpyW(g_nid.szTip, L"FPS Overlay");
-        PublishTrayIcon(false);
+        if (!PublishTrayIcon(false))
+            ScheduleTrayRestoreRetry(tray);
     }
 
     if (g_trayReadyEvent)
@@ -11327,6 +11328,7 @@ static void TrayThreadMain()
             DispatchMessageW(&msg);
         }
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_trayIconPublished = false;
     }
     g_trayHwnd = nullptr;
 }
