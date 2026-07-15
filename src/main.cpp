@@ -379,6 +379,10 @@ static char g_lastConfigRecoveryReason[128] = "";
 static char g_logPath[MAX_PATH] = "";
 static std::mutex g_logMutex;
 static std::mutex g_lhwmStateMutex;
+static std::mutex g_configIoMutex;
+static thread_local const char* g_iniWritePath = nullptr;
+static bool g_ConfigDirty = false;
+static ULONGLONG g_ConfigDirtyTick = 0;
 static FeatureRegistry g_FeatureRegistry;
 static FeatureContext  g_FeatureContext;
 static std::atomic<bool> g_trayShowSystemPower{true};
@@ -559,14 +563,16 @@ static void WriteIniInt(const char* section, const char* key, int value)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "%d", value);
-    WritePrivateProfileStringA(section, key, buf, g_configPath);
+    WritePrivateProfileStringA(section, key, buf,
+                               g_iniWritePath ? g_iniWritePath : g_configPath);
 }
 
 static void WriteIniFloat(const char* section, const char* key, float value)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "%.2f", value);
-    WritePrivateProfileStringA(section, key, buf, g_configPath);
+    WritePrivateProfileStringA(section, key, buf,
+                               g_iniWritePath ? g_iniWritePath : g_configPath);
 }
 
 static void ReadIniStr(const char* section, const char* key, char* out, size_t cap)
@@ -578,7 +584,8 @@ static void ReadIniStr(const char* section, const char* key, char* out, size_t c
 
 static void WriteIniStr(const char* section, const char* key, const char* value)
 {
-    WritePrivateProfileStringA(section, key, value ? value : "", g_configPath);
+    WritePrivateProfileStringA(section, key, value ? value : "",
+                               g_iniWritePath ? g_iniWritePath : g_configPath);
 }
 
 // PawnIO reboot gate — sidecar state (see CommitPawnIORebootPending / CheckPawnIORebootGateOrExit).
@@ -868,9 +875,9 @@ static void MarkWelcomeShown()
     MarkWelcomeShown();
 }
 
-static void SaveConfig(const OverlayConfig& cfg)
+static bool SaveConfig(const OverlayConfig& cfg)
 {
-    std::lock_guard<std::mutex> stateLock(g_lhwmStateMutex);
+    std::lock_guard<std::mutex> configLock(g_configIoMutex);
     InitConfigPath();
 
     int pawnioRb = ReadIniInt("App", "PawnIORequiresReboot", 0);
@@ -888,7 +895,7 @@ static void SaveConfig(const OverlayConfig& cfg)
     snprintf(tempConfigPath, sizeof(tempConfigPath), "%s.tmp", finalConfigPath);
     DeleteFileA(tempConfigPath);
     CopyFileA(finalConfigPath, tempConfigPath, FALSE);
-    snprintf(g_configPath, sizeof(g_configPath), "%s", tempConfigPath);
+    g_iniWritePath = tempConfigPath;
 
     WriteIniInt("App", "schema_version", CONFIG_SCHEMA_VERSION);
     WriteIniStr("App", "app_version", APP_VERSION);
@@ -1011,13 +1018,27 @@ static void SaveConfig(const OverlayConfig& cfg)
     // versions return FALSE here even though the temporary file was written,
     // so the replace operation is the authoritative success check.
     WritePrivateProfileStringA(nullptr, nullptr, nullptr, tempConfigPath);
-    snprintf(g_configPath, sizeof(g_configPath), "%s", finalConfigPath);
+    g_iniWritePath = nullptr;
+    char validationReason[128] = {};
+    if (!ConfigFileLooksUsable(tempConfigPath, validationReason,
+                               sizeof(validationReason))) {
+        DeleteFileA(tempConfigPath);
+        LogLine("Temporary config validation failed: reason=%s",
+                validationReason[0] ? validationReason : "unknown");
+        g_ConfigDirty = true;
+        g_ConfigDirtyTick = GetTickCount64();
+        return false;
+    }
     if (!MoveFileExA(tempConfigPath, finalConfigPath,
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         const DWORD error = GetLastError();
         DeleteFileA(tempConfigPath);
         LogLine("Atomic config save failed: err=%lu", (unsigned long)error);
+        g_ConfigDirty = true;
+        g_ConfigDirtyTick = GetTickCount64();
+        return false;
     }
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1075,8 +1096,6 @@ static float         g_dpiScale   = 1.0f;
 static bool          g_ShowLiveSettings = false;
 static ULONGLONG     g_SettingsRequestTick = 0;
 static bool          g_SettingsFirstFramePending = false;
-static bool          g_ConfigDirty = false;
-static ULONGLONG     g_ConfigDirtyTick = 0;
 
 struct SettingsOpenTrace {
     bool active = false;
@@ -1133,7 +1152,7 @@ static void StartSettingsTrace(const char* source)
 
 static HINSTANCE      g_hInstance = nullptr;
 static HWND           g_hwnd     = nullptr;
-static HWND           g_trayHwnd = nullptr;
+static std::atomic<HWND> g_trayHwnd{nullptr};
 static NOTIFYICONDATAW g_nid     = {};
 static std::thread     g_trayThread;
 static HANDLE          g_trayReadyEvent = nullptr;
@@ -1555,8 +1574,8 @@ static void SetPowerRecoveryStatus(PowerRecoveryStatus status, const char* reaso
     if (previous != status) {
         LogLine("Power recovery status: state=%d reason=%s",
                 static_cast<int>(status), reason ? reason : "N/A");
-        if (g_trayHwnd)
-            PostMessageW(g_trayHwnd, WM_APP_TRAY_RECOVERY_STATUS,
+        if (HWND tray = g_trayHwnd.load(std::memory_order_acquire))
+            PostMessageW(tray, WM_APP_TRAY_RECOVERY_STATUS,
                          static_cast<WPARAM>(status), 0);
     }
 }
@@ -2587,7 +2606,8 @@ static bool IsIgnoredForegroundClass(const char* className)
 // Rewritten from the foreground-window filtering idea in G-Helper
 // app/Overlay/HardwareOverlay.cs at commit d7eb9cbfc2a38d43239dece00e3f5b9a165235c6.
 // This project keeps only read-only process recognition; no ASUS control logic is imported.
-static bool IsLikelyGameForegroundWindow(HWND hwnd, DWORD pid)
+static bool IsLikelyGameForegroundWindow(HWND hwnd, DWORD pid,
+                                         const char* exeName)
 {
     if (!hwnd || pid == 0 || pid == GetCurrentProcessId())
         return false;
@@ -2611,8 +2631,7 @@ static bool IsLikelyGameForegroundWindow(HWND hwnd, DWORD pid)
     if (w < 320 || h < 200)
         return false;
 
-    char exeName[320] = {};
-    if (!GetProcessExeName(pid, exeName, sizeof(exeName)))
+    if (!exeName || !exeName[0])
         return false;
     if (IsIgnoredForegroundProcess(exeName))
         return false;
@@ -2675,41 +2694,74 @@ static bool IsWindowMaximizedOrFullscreen(HWND foreground)
            coversRect(info.rcMonitor);
 }
 
-static void UpdateDesktopVisibilityDecision(HWND foreground, DWORD foregroundPid)
+struct ForegroundSnapshot {
+    HWND window = nullptr;
+    DWORD pid = 0;
+    char exeName[320] = {};
+    char imagePath[1024] = {};
+    bool hasIdentity = false;
+    bool likelyGameWindow = false;
+    bool knownDesktop = false;
+    bool strongGame = false;
+    bool fullscreen = false;
+};
+
+static ForegroundSnapshot CaptureForegroundSnapshot()
+{
+    ForegroundSnapshot snapshot;
+    snapshot.window = GetForegroundWindow();
+    if (!snapshot.window || snapshot.window == g_hwnd)
+        return snapshot;
+
+    GetWindowThreadProcessId(snapshot.window, &snapshot.pid);
+    if (snapshot.pid == 0)
+        return snapshot;
+
+    snapshot.hasIdentity = GetProcessIdentity(
+        snapshot.pid,
+        snapshot.exeName, sizeof(snapshot.exeName),
+        snapshot.imagePath, sizeof(snapshot.imagePath));
+    snapshot.likelyGameWindow = snapshot.hasIdentity &&
+        IsLikelyGameForegroundWindow(snapshot.window, snapshot.pid,
+                                     snapshot.exeName);
+    snapshot.knownDesktop = snapshot.hasIdentity &&
+        IsKnownDesktopProcess(snapshot.exeName);
+    snapshot.strongGame = snapshot.hasIdentity &&
+        HasStrongGameIdentity(snapshot.exeName, snapshot.imagePath);
+    snapshot.fullscreen = IsWindowMaximizedOrFullscreen(snapshot.window);
+    return snapshot;
+}
+
+static void UpdateDesktopVisibilityDecision(
+    const ForegroundSnapshot& foreground)
 {
     static DWORD s_previousPid = 0;
     static ULONGLONG s_foregroundSince = 0;
     static ULONGLONG s_renderEvidenceSince = 0;
 
     const ULONGLONG now = GetTickCount64();
-    if (foregroundPid != s_previousPid) {
-        s_previousPid = foregroundPid;
+    if (foreground.pid != s_previousPid) {
+        s_previousPid = foreground.pid;
         s_foregroundSince = now;
         s_renderEvidenceSince = 0;
     }
 
-    g_DesktopForegroundPid = foregroundPid;
-    g_DesktopForegroundExe[0] = '\0';
-    char imagePath[1024] = {};
-    if (foregroundPid != 0) {
-        GetProcessExeName(foregroundPid, g_DesktopForegroundExe,
-                          sizeof(g_DesktopForegroundExe));
-        GetProcessImagePath(foregroundPid, imagePath, sizeof(imagePath));
-    }
+    g_DesktopForegroundPid = foreground.pid;
+    snprintf(g_DesktopForegroundExe, sizeof(g_DesktopForegroundExe), "%s",
+             foreground.exeName);
 
-    const bool knownDesktop = IsKnownDesktopProcess(g_DesktopForegroundExe);
-    const bool strongGame =
-        HasStrongGameIdentity(g_DesktopForegroundExe, imagePath);
+    const bool knownDesktop = foreground.knownDesktop;
+    const bool strongGame = foreground.strongGame;
     const bool activeGameTarget =
         g_GameOverlayDisplayActive && g_GameOverlayDisplayPid != 0;
     const float directFps =
-        foregroundPid != 0 &&
-        foregroundPid == g_targetPid.load(std::memory_order_relaxed)
+        foreground.pid != 0 &&
+        foreground.pid == g_targetPid.load(std::memory_order_relaxed)
             ? g_gameFps.load(std::memory_order_relaxed)
             : 0.0f;
     const float automaticFps =
-        foregroundPid != 0 &&
-        foregroundPid == g_autoTargetPid.load(std::memory_order_relaxed)
+        foreground.pid != 0 &&
+        foreground.pid == g_autoTargetPid.load(std::memory_order_relaxed)
             ? g_autoGameFps.load(std::memory_order_relaxed)
             : 0.0f;
     const bool hasRenderEvidence =
@@ -2724,7 +2776,7 @@ static void UpdateDesktopVisibilityDecision(HWND foreground, DWORD foregroundPid
         s_renderEvidenceSince != 0 && now - s_renderEvidenceSince >= 600;
     g_ForegroundGameConfirmed = strongGame || sustainedRender || activeGameTarget;
     if (strongGame || sustainedRender) {
-        RememberRecentGame(foregroundPid, g_DesktopForegroundExe);
+        RememberRecentGame(foreground.pid, g_DesktopForegroundExe);
     } else if (activeGameTarget) {
         // The foreground window can briefly be Explorer, Steam, or another
         // desktop helper while the actual game keeps rendering in the background.
@@ -2732,7 +2784,7 @@ static void UpdateDesktopVisibilityDecision(HWND foreground, DWORD foregroundPid
         RefreshRecentGame(g_GameOverlayDisplayPid);
     }
 
-    const bool fullscreen = IsWindowMaximizedOrFullscreen(foreground);
+    const bool fullscreen = foreground.fullscreen;
     if (!g_Config.desktopOnlyMode) {
         g_FullscreenAutoHidden = false;
         g_DesktopVisibilityState = DESKTOP_VISIBILITY_DISABLED;
@@ -5909,6 +5961,8 @@ static bool ExportDiagnosticsPackage(char* outDir, size_t cap)
     std::string gpuLoadPathForDiagnostics;
     std::string gpuPowerPathForDiagnostics;
     std::string gpuFanPathForDiagnostics;
+    std::string gpuVramUsedPathForDiagnostics;
+    std::string gpuVramTotalPathForDiagnostics;
     std::string acInputPathForDiagnostics;
     std::string totalSystemPathForDiagnostics;
     std::vector<PowerSensorCandidate> powerCandidatesForDiagnostics;
@@ -5923,6 +5977,8 @@ static bool ExportDiagnosticsPackage(char* outDir, size_t cap)
         gpuLoadPathForDiagnostics = g_lhwmGpuLoadPath;
         gpuPowerPathForDiagnostics = g_lhwmGpuPowerPath;
         gpuFanPathForDiagnostics = g_lhwmGpuFanPath;
+        gpuVramUsedPathForDiagnostics = g_lhwmGpuVramUsedPath;
+        gpuVramTotalPathForDiagnostics = g_lhwmGpuVramTotalPath;
         acInputPathForDiagnostics = g_lhwmAcInputPowerPath;
         totalSystemPathForDiagnostics = g_lhwmTotalSystemPowerPath;
         powerCandidatesForDiagnostics = g_powerSensorCandidates;
@@ -5981,8 +6037,8 @@ static bool ExportDiagnosticsPackage(char* outDir, size_t cap)
         << "% uncertainty=" << g_FeatureContext.systemPowerEstimateUncertaintyW << " W\n";
     if (g_FeatureContext.systemPowerEstimateBreakdown[0])
         out << "Current model breakdown: " << g_FeatureContext.systemPowerEstimateBreakdown << "\n";
-    out << "VRAM used path: " << (g_lhwmGpuVramUsedPath.empty() ? "N/A" : g_lhwmGpuVramUsedPath) << "\n";
-    out << "VRAM total path: " << (g_lhwmGpuVramTotalPath.empty() ? "N/A" : g_lhwmGpuVramTotalPath) << "\n";
+    out << "VRAM used path: " << (gpuVramUsedPathForDiagnostics.empty() ? "N/A" : gpuVramUsedPathForDiagnostics) << "\n";
+    out << "VRAM total path: " << (gpuVramTotalPathForDiagnostics.empty() ? "N/A" : gpuVramTotalPathForDiagnostics) << "\n";
     out << "\nG-Helper reference\n";
     out << "Repository: https://github.com/seerge/g-helper\n";
     out << "Commit: d7eb9cbfc2a38d43239dece00e3f5b9a165235c6\n";
@@ -6638,7 +6694,15 @@ static ImVec4 FpsTierColor(float fps)
 // ═══════════════════════════════════════════════════════════════════════════
 void AddTrayIcon()
 {
-    if (g_trayThread.joinable()) return;
+    if (g_trayThread.joinable()) {
+        if (g_trayHwnd.load(std::memory_order_acquire))
+            return;
+        g_trayThread.join();
+    }
+    if (g_trayReadyEvent) {
+        CloseHandle(g_trayReadyEvent);
+        g_trayReadyEvent = nullptr;
+    }
     g_trayReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_trayOverlayVisible.store(g_OvlVisible, std::memory_order_relaxed);
     g_trayThread = std::thread(TrayThreadMain);
@@ -6648,7 +6712,7 @@ void AddTrayIcon()
 
 void RemoveTrayIcon()
 {
-    HWND tray = g_trayHwnd;
+    HWND tray = g_trayHwnd.load(std::memory_order_acquire);
     if (tray)
         PostMessageW(tray, WM_CLOSE, 0, 0);
     if (g_trayThread.joinable())
@@ -6661,8 +6725,8 @@ void RemoveTrayIcon()
 
 void UpdateTrayTooltip()
 {
-    if (g_trayHwnd)
-        PostMessageW(g_trayHwnd, WM_APP_TRAY_TOOLTIP, 0, 0);
+    if (HWND tray = g_trayHwnd.load(std::memory_order_acquire))
+        PostMessageW(tray, WM_APP_TRAY_TOOLTIP, 0, 0);
 }
 
 static int ScalePx(int px)
@@ -7664,8 +7728,8 @@ static void FlushConfigIfDirty(bool force = false)
         return;
     if (!force && now - g_ConfigDirtyTick < 750)
         return;
-    SaveConfig(g_Config);
-    g_ConfigDirty = false;
+    if (SaveConfig(g_Config))
+        g_ConfigDirty = false;
 }
 
 static void UpdateHotkeyCapture()
@@ -8533,7 +8597,29 @@ static void DrawLiveSettingsPanel()
 // ═══════════════════════════════════════════════════════════════════════════
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
 {
+    struct InstanceMutexGuard {
+        HANDLE handle = nullptr;
+        ~InstanceMutexGuard() { if (handle) CloseHandle(handle); }
+    } instanceMutex;
+
     g_hInstance = hInst;
+#if defined(FPSOVERLAY_UI_QA)
+    constexpr wchar_t kInstanceMutexName[] = L"Local\\FPSOverlay.UiQa.Singleton";
+#else
+    constexpr wchar_t kInstanceMutexName[] = L"Local\\FPSOverlay.Singleton";
+#endif
+    SetLastError(ERROR_SUCCESS);
+    instanceMutex.handle = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
+    const DWORD instanceMutexError = GetLastError();
+    if (instanceMutex.handle && instanceMutexError == ERROR_ALREADY_EXISTS) {
+        if (HWND existing = FindWindowA("FPSOverlay", nullptr))
+            PostMessageW(existing, WM_APP_TRAY_COMMAND, IDM_SETTINGS, 0);
+        return 0;
+    }
+    if (!instanceMutex.handle)
+        LogLine("Single-instance mutex unavailable: err=%lu",
+                (unsigned long)instanceMutexError);
+
     g_TaskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     const bool autoSettingsTrace =
         commandLine && strstr(commandLine, "--diagnose-settings") != nullptr;
@@ -8698,8 +8784,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
         if (g_PowerResumePending) {
             g_PowerResumePending = false;
             RestoreOverlayWindowAfterPowerResume();
-            if (g_trayHwnd)
-                PostMessageW(g_trayHwnd, WM_APP_TRAY_RESTORE, 0, 0);
+            if (HWND tray = g_trayHwnd.load(std::memory_order_acquire))
+                PostMessageW(tray, WM_APP_TRAY_RESTORE, 0, 0);
             DelayLhwmReadsAfterResume();
         }
         ResumeLhwmReadsWhenReady();
@@ -8732,12 +8818,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                 QueueShowSettings();
             }
         }
-        if (autoTrayTrace && g_Mode == MODE_OVERLAY && !autoTrayTraceDone && g_trayHwnd) {
+        if (autoTrayTrace && g_Mode == MODE_OVERLAY && !autoTrayTraceDone &&
+            g_trayHwnd.load(std::memory_order_acquire)) {
             if (autoTrayTraceReadyTick == 0)
                 autoTrayTraceReadyTick = GetTickCount64();
             if (GetTickCount64() - autoTrayTraceReadyTick >= 2000) {
                 autoTrayTraceDone = true;
-                HWND tray = g_trayHwnd;
+                HWND tray = g_trayHwnd.load(std::memory_order_acquire);
                 PostMessageW(tray, WM_TRAYICON, 1, MAKELPARAM(WM_RBUTTONUP, 1));
                 std::thread([tray]() {
                     Sleep(300);
@@ -9251,43 +9338,44 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             if (foregroundNow - s_lastForegroundPoll >= 250) {
                 s_lastForegroundPoll = foregroundNow;
                 const DWORD previousTargetPid = currentPid;
-                HWND fg = GetForegroundWindow();
-                DWORD fgPid = 0;
+                const ForegroundSnapshot foreground = CaptureForegroundSnapshot();
+                const DWORD fgPid = foreground.pid;
                 bool foregroundBlocksGameTarget = false;
-                bool foregroundStrongGame = false;
-                bool foregroundKnownDesktop = false;
+                const bool foregroundStrongGame =
+                    foreground.likelyGameWindow && foreground.strongGame;
+                const bool foregroundKnownDesktop = foreground.knownDesktop;
                 bool gameDisplayActive = false;
                 DWORD proposedPid = 0;
                 bool proposedImmediate = false;
                 const char* proposedReason = nullptr;
                 char proposedExe[320] = {};
-                if (fg && fg != g_hwnd) {
-                    GetWindowThreadProcessId(fg, &fgPid);
-                    if (IsLikelyGameForegroundWindow(fg, fgPid)) {
-                        char fgExe[320] = {};
-                        char fgPath[1024] = {};
-                        GetProcessIdentity(fgPid, fgExe, sizeof(fgExe), fgPath, sizeof(fgPath));
-                        foregroundStrongGame = HasStrongGameIdentity(fgExe, fgPath);
-                        foregroundKnownDesktop = IsKnownDesktopProcess(fgExe);
-                        foregroundBlocksGameTarget =
-                            fgExe[0] && foregroundKnownDesktop && !foregroundStrongGame &&
-                            IsWindowMaximizedOrFullscreen(fg);
-                        if (foregroundStrongGame) {
-                            proposedPid = fgPid;
-                            proposedImmediate = true;
-                            proposedReason = "foreground strong game";
-                            snprintf(proposedExe, sizeof(proposedExe), "%s", fgExe);
-                        }
+                if (foreground.likelyGameWindow) {
+                    foregroundBlocksGameTarget =
+                        foregroundKnownDesktop && !foregroundStrongGame &&
+                        foreground.fullscreen;
+                    if (foregroundStrongGame) {
+                        proposedPid = fgPid;
+                        proposedImmediate = true;
+                        proposedReason = "foreground strong game";
+                        snprintf(proposedExe, sizeof(proposedExe), "%s",
+                                 foreground.exeName);
                     }
                 }
 
                 const DWORD autoPid = g_autoTargetPid.load(std::memory_order_relaxed);
                 const float autoFps = g_autoGameFps.load(std::memory_order_relaxed);
                 char autoExe[320] = {};
-                const bool autoStrongGame =
-                    !foregroundBlocksGameTarget &&
-                    autoPid != 0 && autoFps >= 12.0f &&
-                    IsStrongGameProcess(autoPid, autoExe, sizeof(autoExe));
+                bool autoStrongGame = false;
+                if (!foregroundBlocksGameTarget && autoPid != 0 && autoFps >= 12.0f) {
+                    if (autoPid == foreground.pid && foreground.likelyGameWindow) {
+                        autoStrongGame = foregroundStrongGame;
+                        if (autoStrongGame)
+                            snprintf(autoExe, sizeof(autoExe), "%s", foreground.exeName);
+                    } else {
+                        autoStrongGame = IsStrongGameProcess(
+                            autoPid, autoExe, sizeof(autoExe));
+                    }
+                }
                 const bool sustainedUnknownForeground =
                     !foregroundBlocksGameTarget && !foregroundKnownDesktop &&
                     fgPid != 0 && autoPid == fgPid && autoFps >= 20.0f;
@@ -9372,7 +9460,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
 
                 const bool wasAutoHidden = g_FullscreenAutoHidden;
                 const DesktopVisibilityState previousState = g_DesktopVisibilityState;
-                UpdateDesktopVisibilityDecision(fg, fgPid);
+                UpdateDesktopVisibilityDecision(foreground);
                 if (wasAutoHidden != g_FullscreenAutoHidden ||
                     previousState != g_DesktopVisibilityState) {
                     LogLine("Desktop-only decision: pid=%lu exe=%s state=%d hidden=%s reason=%s fps=%.1f autoPid=%lu autoFps=%.1f recentGame=%lu target=%lu gameDisplay=%d",
@@ -10857,8 +10945,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
     }
 
     // ═══ Cleanup ═══
-    FlushConfigIfDirty(true);
-    SaveConfig(g_Config);  // Save settings before exit
+    if (!SaveConfig(g_Config)) {
+        Sleep(100);
+        SaveConfig(g_Config);
+    }
     g_FeatureRegistry.Shutdown();
     g_lhwmReadsPaused.store(true, std::memory_order_release);
     if (g_lhwmInitThread.joinable())
@@ -11083,39 +11173,67 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
+static void InitializeTrayIconData(HWND owner)
+{
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = owner;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIcon(g_hInstance, MAKEINTRESOURCE(1));
+    if (!g_nid.hIcon)
+        g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    lstrcpyW(g_nid.szTip, L"FPS Overlay");
+}
+
 static bool PublishTrayIcon(bool replaceExisting)
 {
-    if (!g_nid.hWnd)
+    const HWND owner = g_nid.hWnd;
+    if (!owner)
         return false;
 
     if (replaceExisting && g_trayIconPublished &&
         Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
         return true;
     }
-    if (replaceExisting && g_trayIconPublished)
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+
+    InitializeTrayIconData(owner);
+    SetLastError(ERROR_SUCCESS);
     if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
         g_trayIconPublished = true;
         g_nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
         return true;
-    } else {
-        g_trayIconPublished = false;
-        LogLine("Tray icon publish failed: replace=%d err=%lu",
-                replaceExisting ? 1 : 0,
-                (unsigned long)GetLastError());
-        return false;
     }
+    const DWORD addErrorHint = GetLastError();
+
+    // A timed-out NIM_ADD can still reach Explorer. A modify probe avoids
+    // deleting an icon that the shell accepted after the caller timed out.
+    if (Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
+        g_trayIconPublished = true;
+        return true;
+    }
+
+    g_trayIconPublished = false;
+    LogLine("Tray icon publish failed: replace=%d addErrorHint=%lu shell=%p",
+            replaceExisting ? 1 : 0,
+            (unsigned long)addErrorHint,
+            FindWindowW(L"Shell_TrayWnd", nullptr));
+    return false;
 }
 
 static void ScheduleTrayRestoreRetry(HWND hWnd)
 {
-    static constexpr UINT retryDelaysMs[] = {1000, 3000, 8000};
-    if (!hWnd || g_trayRestoreRetryIndex >= ARRAYSIZE(retryDelaysMs)) {
-        LogLine("Tray icon restore retries exhausted");
+    static constexpr UINT retryDelaysMs[] = {1000, 3000, 8000, 15000, 30000};
+    if (!hWnd)
         return;
-    }
-    const UINT delay = retryDelaysMs[g_trayRestoreRetryIndex++];
+    const size_t delayIndex = (std::min)(
+        static_cast<size_t>(g_trayRestoreRetryIndex),
+        ARRAYSIZE(retryDelaysMs) - 1);
+    const UINT delay = retryDelaysMs[delayIndex];
+    if (g_trayRestoreRetryIndex != UINT_MAX)
+        ++g_trayRestoreRetryIndex;
     SetTimer(hWnd, kTrayRestoreTimerId, delay, nullptr);
     LogLine("Tray icon restore retry scheduled: attempt=%u delay=%u ms",
             g_trayRestoreRetryIndex, delay);
@@ -11227,7 +11345,8 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     case WM_APP_TRAY_TOOLTIP:
         lstrcpyW(g_nid.szTip, L"FPS Overlay");
-        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+        if (!g_trayIconPublished || !Shell_NotifyIconW(NIM_MODIFY, &g_nid))
+            RestoreTrayIcon(hWnd, false);
         return 0;
     case WM_APP_TRAY_RECOVERY_STATUS:
         {
@@ -11264,6 +11383,7 @@ LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             KillTimer(hWnd, kTrayRestoreTimerId);
             if (PublishTrayIcon(false)) {
                 g_trayRestoreRetryIndex = 0;
+                g_trayLastRestoreTick = GetTickCount64();
                 LogLine("Tray icon restored by retry");
             } else {
                 ScheduleTrayRestoreRetry(hWnd);
@@ -11297,23 +11417,14 @@ static void TrayThreadMain()
         "FPSOverlayTray", "FPS Overlay Tray Owner", WS_POPUP,
         -32000, -32000, 1, 1,
         nullptr, nullptr, g_hInstance, nullptr);
-    g_trayHwnd = tray;
+    g_trayHwnd.store(tray, std::memory_order_release);
 
     if (tray) {
         if (g_TaskbarCreatedMessage != 0) {
             ChangeWindowMessageFilterEx(
                 tray, g_TaskbarCreatedMessage, MSGFLT_ALLOW, nullptr);
         }
-        ZeroMemory(&g_nid, sizeof(g_nid));
-        g_nid.cbSize = sizeof(g_nid);
-        g_nid.hWnd = tray;
-        g_nid.uID = 1;
-        g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        g_nid.uCallbackMessage = WM_TRAYICON;
-        g_nid.hIcon = LoadIcon(g_hInstance, MAKEINTRESOURCE(1));
-        if (!g_nid.hIcon)
-            g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-        lstrcpyW(g_nid.szTip, L"FPS Overlay");
+        InitializeTrayIconData(tray);
         if (!PublishTrayIcon(false))
             ScheduleTrayRestoreRetry(tray);
     }
@@ -11330,5 +11441,5 @@ static void TrayThreadMain()
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         g_trayIconPublished = false;
     }
-    g_trayHwnd = nullptr;
+    g_trayHwnd.store(nullptr, std::memory_order_release);
 }

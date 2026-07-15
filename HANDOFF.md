@@ -1,11 +1,11 @@
 # FPSOverlay 接续开发交接
 
-更新时间：2026-07-12
+更新时间：2026-07-15
 
 ## 当前交付状态
 
-- 当前版本：`v1.10.35`
-- 编译时间标识：`20260712-1828`
+- 当前版本：`v1.10.36`
+- 编译时间标识：`20260714-2335`
 - 项目根目录：`C:\Users\ROG\Desktop\FPSOverlay_完整项目`
 - 当前源码：`C:\Users\ROG\Desktop\FPSOverlay_完整项目\当前版本\源代码`
 - 当前发布程序：`C:\Users\ROG\Desktop\FPSOverlay_完整项目\当前版本\发布程序`
@@ -18,8 +18,9 @@
   - `overlay_v1.10.33_20260712-1347.exe`
   - `overlay_v1.10.34_20260712-1359.exe`
   - `overlay_v1.10.35_20260712-1828.exe`
-- 当前 `overlay.exe` SHA256：`2D2383ACD87B174552E8768B969B9D426379FE5017220B7CEA8015D7CBA44C0A`
-- 最近归档：`旧版本归档\2026-07-12_1823_v1.10.34_再次代码审查优化前`
+  - `overlay_v1.10.36_20260714-2335.exe`
+- 当前 `overlay.exe` SHA256：`7596E9948F7F381E6652AFFBFE27A962827B219760906BAE3E8DE8E311BC2589`
+- 最近归档：`旧版本归档\2026-07-15_1846_v1.10.36_休眠实测同步前`
 
 ## 新会话开始前必须检查
 
@@ -132,6 +133,15 @@
 
 ## 最近验证结果
 
+- `v1.10.36` Release 和 `FPSOVERLAY_UI_QA` 均以 `/W4 /permissive- /Zi` 无警告编译通过；Windows `FileVersion` 为 `1.10.36.0`，`ProductVersion` 为 `v1.10.36 (2026-07-14 23:35)`。
+- v1.10.36 托盘恢复改为持续退避重试，每次重新添加重建通知区数据，并以原子窗口句柄消除主线程/托盘线程的数据竞争。
+- v1.10.36 增加单实例互斥；QA 双启动确认第二个实例以代码 0 退出，第一个实例保持运行并可干净退出。
+- v1.10.36 前台识别每 250ms 只构造一次进程快照，游戏目标与桌面显示判定复用 PID、exe、路径和全屏结果。
+- v1.10.36 配置保存与 LHWM 状态锁分离，临时文件先验证再替换，失败保留脏状态继续重试；诊断导出显存路径的数据竞争已修复。
+- v1.10.36 未修改 Overlay 指标、七个设置页面、游戏加加绘制块、指标顺序和绘制样式；正式 Release 未在交付过程中启动。
+- 2026-07-15 实机休眠唤醒同步：唤醒后由自启动机制启动 `v1.10.36`，日志记录 `App start`、LHWM 初始化成功，随后《鸣潮》游戏目标、Overlay 宿主和 FPS 数据均恢复正常。
+- 本次实机结果证明“唤醒后自动启动并恢复监测”可用；由于休眠前没有运行同一份 `v1.10.36` 正式进程，尚不能证明“原进程存活并仅恢复托盘图标”。
+- 休眠前日志中 v1.10.35 的 `Tray icon restore retries exhausted` 属于旧版本历史记录，不作为 v1.10.36 的验证结果。
 - `v1.10.35` Release 和 `FPSOVERLAY_UI_QA` 均以 `/W4 /permissive- /Zi` 无警告编译通过；Windows `FileVersion` 为 `1.10.35.0`，`ProductVersion` 为 `v1.10.35 (2026-07-12 18:28)`。
 - v1.10.35 游戏目标改为最终稳定后统一发布：未知前台程序不能直接抢占，已确认目标失证据保留 3 秒，不同目标需稳定 1.5 秒再切换；`KRSDKExternal`、崩溃报告器和常见 CEF 子进程已排除。
 - v1.10.35 托盘恢复优先修改现有图标，重新添加失败时按 1/3/8 秒重试；500ms 内重复的主窗口/托盘恢复消息会合并。
@@ -179,7 +189,7 @@
 - 七个设置页面、常用窗口尺寸和键盘焦点已完成代码与构建检查。
 - Windows 界面自动检查组件缺少内部模块，本轮未能抓取 QA 窗口截图；未改用正式程序代替。
 - 正式发布程序没有在交付过程中启动。
-- `FEATURES.md` 和 `TESTING.md` 已更新到 `v1.10.35`。
+- `FEATURES.md` 和 `TESTING.md` 已更新到 `v1.10.36`。
 
 `README.md` 在 `.codexignore` 中，因此本轮没有改写；以 `HANDOFF.md`、`FEATURES.md`、`TESTING.md` 和实际源码为准。
 <!-- 2026-06-28 v1.10.20: Fixed multi-GPU sensor binding. Stale Intel gpuCoreFreqPath can no longer force the overlay to monitor an iGPU when a discrete GPU has richer temperature/VRAM/power telemetry. Current release config is set to selectedGpu=1 and gpuCoreFreqPath=/gpu-nvidia/0/clock/0. -->
