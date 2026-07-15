@@ -42,6 +42,7 @@
 #include <cwctype>
 #include <ctime>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -1292,6 +1293,8 @@ struct LhwmStatsSnapshot {
     float memoryTemp = 0.0f;
     float diskActivityPercent = 0.0f;
     float networkUtilizationPercent = 0.0f;
+    float cpuClockMHz = 0.0f;
+    float gpuCoreClockMHz = 0.0f;
     std::string acInputPowerSourceName;
     std::string totalSystemPowerSourceName;
 };
@@ -1620,27 +1623,6 @@ static void ResumeLhwmReadsWhenReady()
     if (readyTick != 0 && GetTickCount64() >= readyTick) {
         g_lhwmResumeReadyTick.store(0, std::memory_order_release);
         LogLine("LibreHardwareMonitor polling resumed after power recovery");
-    }
-}
-
-static void PollClockSensors()
-{
-    try {
-        if (g_Config.showCpuFreq && g_lhwmAvailable && g_Config.cpuFreqPath[0])
-            g_cpuClockMHz = ReadLhwmSensorValue(std::string(g_Config.cpuFreqPath));
-        else if (g_Config.showCpuFreq)
-            g_cpuClockMHz = QueryCpuClockMHzFallback();
-        else
-            g_cpuClockMHz = 0.f;
-
-        if (g_Config.showGpuCoreFreq && g_lhwmAvailable && g_Config.gpuCoreFreqPath[0])
-            g_gpuCoreClockMHz = ReadLhwmSensorValue(std::string(g_Config.gpuCoreFreqPath));
-        else
-            g_gpuCoreClockMHz = 0.f;
-
-        SparkPush(g_cpuSpark, g_cpuSparkN, FREQ_SPARK_LEN, g_cpuClockMHz > 0.f ? g_cpuClockMHz : 0.f);
-        SparkPush(g_gpuSpark, g_gpuSparkN, FREQ_SPARK_LEN, g_gpuCoreClockMHz > 0.f ? g_gpuCoreClockMHz : 0.f);
-    } catch (...) {
     }
 }
 
@@ -2831,6 +2813,14 @@ static void UpdateDesktopVisibilityDecision(
 static IWbemLocator*   g_pWbemLocator  = nullptr;
 static IWbemServices*  g_pWbemServices = nullptr;
 static bool            g_wmiInitialized = false;
+static std::thread     g_wmiCpuWorkerThread;
+static std::mutex      g_wmiCpuWorkerMutex;
+static std::condition_variable g_wmiCpuWorkerCv;
+static bool            g_wmiCpuWorkerStop = false;
+static bool            g_wmiCpuPollRequested = false;
+static bool            g_wmiCpuResultReady = false;
+static bool            g_wmiCpuResultAvailable = false;
+static float           g_wmiCpuResultC = 0.0f;
 static IWbemLocator*   g_pAsusWmiLocator  = nullptr;
 static IWbemServices*  g_pAsusWmiServices = nullptr;
 static bool            g_asusWmiInitialized = false;
@@ -3227,13 +3217,13 @@ static float QueryCpuTemperature()
             nullptr, &pEnumerator);
     }
     
-    if (FAILED(hr)) return 0.0f;
+    if (FAILED(hr) || !pEnumerator) return 0.0f;
     
     float temp = 0.0f;
     IWbemClassObject* pObj = nullptr;
     ULONG returned = 0;
     
-    if (pEnumerator->Next(WBEM_INFINITE, 1, &pObj, &returned) == S_OK && returned > 0) {
+    if (pEnumerator->Next(500, 1, &pObj, &returned) == S_OK && returned > 0) {
         VARIANT vtProp;
         VariantInit(&vtProp);
         
@@ -3256,6 +3246,98 @@ static float QueryCpuTemperature()
     
     pEnumerator->Release();
     return temp;
+}
+
+static void WmiCpuWorkerMain()
+{
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(g_wmiCpuWorkerMutex);
+            g_wmiCpuWorkerCv.wait(lock, []() {
+                return g_wmiCpuWorkerStop || g_wmiCpuPollRequested;
+            });
+            if (g_wmiCpuWorkerStop)
+                break;
+            g_wmiCpuPollRequested = false;
+        }
+
+        const float temperatureC = QueryCpuTemperature();
+        const bool available =
+            std::isfinite(temperatureC) && temperatureC > 0.0f && temperatureC < 150.0f;
+        {
+            std::lock_guard<std::mutex> lock(g_wmiCpuWorkerMutex);
+            g_wmiCpuResultC = available ? temperatureC : 0.0f;
+            g_wmiCpuResultAvailable = available;
+            g_wmiCpuResultReady = true;
+        }
+    }
+    if (SUCCEEDED(comResult))
+        CoUninitialize();
+}
+
+static void StartWmiCpuWorker()
+{
+    if (!g_wmiInitialized || g_wmiCpuWorkerThread.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(g_wmiCpuWorkerMutex);
+        g_wmiCpuWorkerStop = false;
+        g_wmiCpuPollRequested = true;
+        g_wmiCpuResultReady = false;
+    }
+    g_wmiCpuWorkerThread = std::thread(WmiCpuWorkerMain);
+    g_wmiCpuWorkerCv.notify_one();
+}
+
+static void RequestWmiCpuPoll()
+{
+    if (!g_wmiCpuWorkerThread.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(g_wmiCpuWorkerMutex);
+        if (g_wmiCpuWorkerStop)
+            return;
+        g_wmiCpuPollRequested = true;
+    }
+    g_wmiCpuWorkerCv.notify_one();
+}
+
+static void ApplyWmiCpuSnapshot()
+{
+    float temperatureC = 0.0f;
+    bool available = false;
+    {
+        std::lock_guard<std::mutex> lock(g_wmiCpuWorkerMutex);
+        if (!g_wmiCpuResultReady)
+            return;
+        temperatureC = g_wmiCpuResultC;
+        available = g_wmiCpuResultAvailable;
+        g_wmiCpuResultReady = false;
+    }
+
+    bool hasLhwmCpuTemperature = false;
+    {
+        std::lock_guard<std::mutex> lock(g_lhwmStateMutex);
+        hasLhwmCpuTemperature =
+            g_lhwmAvailable.load(std::memory_order_acquire) &&
+            !g_lhwmCpuTempPath.empty() && g_lhwmCpuTemp > 0.0f;
+    }
+    if (hasLhwmCpuTemperature)
+        return;
+    g_cpuTemp = available ? temperatureC : 0.0f;
+    g_cpuTempAvailable = available;
+}
+
+static void StopWmiCpuWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_wmiCpuWorkerMutex);
+        g_wmiCpuWorkerStop = true;
+    }
+    g_wmiCpuWorkerCv.notify_one();
+    if (g_wmiCpuWorkerThread.joinable())
+        g_wmiCpuWorkerThread.join();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5397,6 +5479,10 @@ static void ScheduleAsyncLHWMStatsPoll()
     std::vector<std::string> memoryTempPaths;
     std::vector<std::string> diskActivityPaths;
     std::vector<std::string> networkLoadPaths;
+    const bool showCpuClock = g_Config.showCpuFreq;
+    const bool showGpuClock = g_Config.showGpuCoreFreq;
+    const std::string cpuClockPath = showCpuClock ? g_Config.cpuFreqPath : "";
+    const std::string gpuClockPath = showGpuClock ? g_Config.gpuCoreFreqPath : "";
     {
         std::lock_guard<std::mutex> lock(g_lhwmStateMutex);
         cpuTempPath = g_lhwmCpuTempPath;
@@ -5447,7 +5533,11 @@ static void ScheduleAsyncLHWMStatsPoll()
         diskTempPaths,
         memoryTempPaths,
         diskActivityPaths,
-        networkLoadPaths
+        networkLoadPaths,
+        showCpuClock,
+        showGpuClock,
+        cpuClockPath,
+        gpuClockPath
     ]() {
         const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         LhwmStatsSnapshot snap;
@@ -5517,6 +5607,13 @@ static void ScheduleAsyncLHWMStatsPoll()
                     (std::max)(snap.networkUtilizationPercent,
                                (std::clamp)(value, 0.0f, 100.0f));
             }
+            if (showCpuClock) {
+                snap.cpuClockMHz = cpuClockPath.empty()
+                    ? QueryCpuClockMHzFallback()
+                    : readPositive(cpuClockPath);
+            }
+            if (showGpuClock)
+                snap.gpuCoreClockMHz = readPositive(gpuClockPath);
 
             float asusFan = 0.0f;
             if ((cpuFanPath.empty() || snap.cpuFanRpm <= 0.0f) &&
@@ -5566,8 +5663,10 @@ static void ApplyAsyncLHWMStatsSnapshot()
         return;
 
     g_lhwmCpuTemp = snap.lhwmCpuTemp;
-    if (snap.lhwmCpuTemp > 0.0f)
+    if (snap.lhwmCpuTemp > 0.0f) {
         g_cpuTemp = snap.lhwmCpuTemp;
+        g_cpuTempAvailable = true;
+    }
     g_gpuTemp = snap.gpuTemp;
     g_gpuUsage = snap.gpuUsage;
     g_vramUsed = snap.vramUsed;
@@ -5602,6 +5701,12 @@ static void ApplyAsyncLHWMStatsSnapshot()
     g_memoryTemp = snap.memoryTemp;
     g_diskActivityPercent = snap.diskActivityPercent;
     g_networkUtilizationPercent = snap.networkUtilizationPercent;
+    g_cpuClockMHz = snap.cpuClockMHz;
+    g_gpuCoreClockMHz = snap.gpuCoreClockMHz;
+    SparkPush(g_cpuSpark, g_cpuSparkN, FREQ_SPARK_LEN,
+              g_cpuClockMHz > 0.0f ? g_cpuClockMHz : 0.0f);
+    SparkPush(g_gpuSpark, g_gpuSparkN, FREQ_SPARK_LEN,
+              g_gpuCoreClockMHz > 0.0f ? g_gpuCoreClockMHz : 0.0f);
     if (g_PowerRecoveryStatus.load(std::memory_order_acquire) ==
             PowerRecoveryStatus::Recovering &&
         g_lhwmResumeReadyTick.load(std::memory_order_acquire) == 0) {
@@ -8705,11 +8810,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
 #endif
     
     // Try WMI for CPU temperature as fallback (LHWM may enable CPU temp when init completes)
-    g_cpuTempAvailable = InitWMI();
-    if (g_cpuTempAvailable) {
-        float testTemp = QueryCpuTemperature();
-        g_cpuTempAvailable = (testTemp > 0.0f && testTemp < 150.0f);
-    }
+    g_cpuTempAvailable = false;
+    if (InitWMI())
+        StartWmiCpuWorker();
     WriteAsusWmiDiagnostics();
 
     // Show config window (unless auto-start is enabled)
@@ -8791,6 +8894,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
         ResumeLhwmReadsWhenReady();
         UpdatePowerRecoveryStatus();
         ProcessLhwmRescanRequest();
+        ApplyWmiCpuSnapshot();
         if (g_D3DRecoveryPending && !RecoverD3DDevice()) {
             MsgWaitForMultipleObjectsEx(
                 0, nullptr, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -9570,10 +9674,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                 if (cpuElapsed >= refreshSec) {
                     cpuUsage = GetCpuUsage();
                     // Poll CPU temp - prefer LHWM over WMI
-                    if (!pauseHeavySensors && g_lhwmAvailable && !g_lhwmCpuTempPath.empty()) {
-                        g_cpuTemp = g_lhwmCpuTemp;
-                    } else if (!pauseHeavySensors && g_cpuTempAvailable) {
-                        g_cpuTemp = QueryCpuTemperature();
+                    if (!pauseHeavySensors) {
+                        if (g_lhwmAvailable && !g_lhwmCpuTempPath.empty() &&
+                            g_lhwmCpuTemp > 0.0f) {
+                            g_cpuTemp = g_lhwmCpuTemp;
+                            g_cpuTempAvailable = true;
+                        } else {
+                            RequestWmiCpuPoll();
+                        }
                     }
                     lastCpuTime = now;
                 }
@@ -9620,14 +9728,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                     UpdateNetworkRates();
                 }
 
-                static auto lastClkPoll = Clock::now();
-                float clkDt = std::chrono::duration<float>(now - lastClkPoll).count();
-                const float clkRefreshSec =
+                static auto lastClockFallbackPoll = Clock::now();
+                const float clockFallbackElapsed =
+                    std::chrono::duration<float>(now - lastClockFallbackPoll).count();
+                const float clockFallbackRefreshSec =
                     (std::max)(0.5f, (float)g_Config.refreshMs / 1000.0f);
-                if (!powerComparisonRecording &&
-                    !pauseHeavySensors && clkDt >= clkRefreshSec) {
-                    lastClkPoll = now;
-                    PollClockSensors();
+                if (!powerComparisonRecording && !pauseHeavySensors &&
+                    !g_lhwmAvailable.load(std::memory_order_acquire) &&
+                    clockFallbackElapsed >= clockFallbackRefreshSec) {
+                    lastClockFallbackPoll = now;
+                    g_cpuClockMHz = g_Config.showCpuFreq
+                        ? QueryCpuClockMHzFallback() : 0.0f;
+                    g_gpuCoreClockMHz = 0.0f;
+                    SparkPush(g_cpuSpark, g_cpuSparkN, FREQ_SPARK_LEN,
+                              g_cpuClockMHz > 0.0f ? g_cpuClockMHz : 0.0f);
+                    SparkPush(g_gpuSpark, g_gpuSparkN, FREQ_SPARK_LEN, 0.0f);
                 }
             }
             ApplyAsyncLHWMStatsSnapshot();
@@ -10957,6 +11072,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
         g_asyncLhwmPollThread.join();
     if (g_comparisonPowerPollThread.joinable())
         g_comparisonPowerPollThread.join();
+    StopWmiCpuWorker();
     ShutdownWindowsPowerCounters();
     StopEtwSession();
     if (g_Mode == MODE_OVERLAY) RemoveTrayIcon();
