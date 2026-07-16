@@ -1,6 +1,7 @@
 #include "GameSessionReportFeature.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -37,6 +38,10 @@ constexpr ULONGLONG kSampleIntervalMs = 1000;
 constexpr double kAutoOpenDurationSeconds = 30.0;
 constexpr size_t kMaxSamples = 8u * 60u * 60u;
 constexpr size_t kMaxHistoryEntries = 100;
+constexpr size_t kMaxHistoryFilesInspected = 10000;
+constexpr uintmax_t kMaxHistoryFileBytes = 16u * 1024u * 1024u;
+constexpr size_t kMaxCsvLineBytes = 64u * 1024u;
+constexpr size_t kFpsHistogramBins = 10001;
 
 enum class MetricId {
     Fps,
@@ -88,6 +93,20 @@ struct SessionData {
     HardwareInfo hardware;
     std::vector<GameSessionSample> samples;
     MetricStatistics statistics[static_cast<size_t>(MetricId::Count)] = {};
+    double statisticSums[static_cast<size_t>(MetricId::Count)] = {};
+    size_t totalSampleCount = 0;
+    size_t retainedSampleStride = 1;
+    size_t validPowerSampleCount = 0;
+    bool statisticsAuthoritative = false;
+    bool hasAnyValidSample = false;
+    double firstValidSampleElapsed = 0.0;
+    double lastValidSampleElapsed = 0.0;
+    bool hasPreviousPowerSample = false;
+    double previousPowerElapsed = 0.0;
+    float previousPowerW = 0.0f;
+    bool previousPowerEstimated = false;
+    std::array<uint32_t, kFpsHistogramBins> fpsHistogramCounts = {};
+    std::array<double, kFpsHistogramBins> fpsHistogramSums = {};
     double onePercentLowFps = 0.0;
     bool hasOnePercentLowFps = false;
     double energyWh = 0.0;
@@ -446,8 +465,107 @@ bool SampleHasAnyValidValue(const GameSessionSample& sample)
            sample.systemPowerValid;
 }
 
+void AccumulateLiveSample(SessionData& session,
+                          const GameSessionSample& sample)
+{
+    ++session.totalSampleCount;
+    for (size_t index = 0; index < static_cast<size_t>(MetricId::Count); ++index) {
+        const auto [value, valid] = MetricValue(
+            sample, static_cast<MetricId>(index));
+        if (!valid || !IsFinite(value))
+            continue;
+        MetricStatistics& statistics = session.statistics[index];
+        if (statistics.validSamples == 0) {
+            statistics.minimum = value;
+            statistics.maximum = value;
+        } else {
+            statistics.minimum = (std::min)(statistics.minimum, static_cast<double>(value));
+            statistics.maximum = (std::max)(statistics.maximum, static_cast<double>(value));
+        }
+        session.statisticSums[index] += value;
+        ++statistics.validSamples;
+        statistics.average = session.statisticSums[index] /
+            static_cast<double>(statistics.validSamples);
+    }
+
+    if (sample.fpsValid && IsFinite(sample.fps) && sample.fps > 0.0f) {
+        const size_t bin = (std::min)(
+            kFpsHistogramBins - 1,
+            static_cast<size_t>(std::lround(sample.fps * 10.0f)));
+        ++session.fpsHistogramCounts[bin];
+        session.fpsHistogramSums[bin] += sample.fps;
+    }
+
+    if (SampleHasAnyValidValue(sample)) {
+        if (!session.hasAnyValidSample) {
+            session.hasAnyValidSample = true;
+            session.firstValidSampleElapsed = sample.elapsedSeconds;
+        }
+        session.lastValidSampleElapsed = sample.elapsedSeconds;
+        session.validSampleDurationSeconds = (std::max)(
+            0.0, session.lastValidSampleElapsed - session.firstValidSampleElapsed);
+    }
+
+    if (!sample.systemPowerValid)
+        return;
+    ++session.validPowerSampleCount;
+    session.energyIncludesEstimate =
+        session.energyIncludesEstimate || sample.systemPowerEstimated;
+    if (session.hasPreviousPowerSample) {
+        const double elapsedSeconds =
+            sample.elapsedSeconds - session.previousPowerElapsed;
+        if (elapsedSeconds > 0.0 && elapsedSeconds <= 3.0) {
+            session.energyWh +=
+                (static_cast<double>(session.previousPowerW) + sample.systemPower) *
+                0.5 * elapsedSeconds / 3600.0;
+            session.energyIncludesEstimate = session.energyIncludesEstimate ||
+                session.previousPowerEstimated;
+        }
+    }
+    session.hasPreviousPowerSample = true;
+    session.previousPowerElapsed = sample.elapsedSeconds;
+    session.previousPowerW = sample.systemPower;
+    session.previousPowerEstimated = sample.systemPowerEstimated;
+}
+
+void FinalizeLiveStatistics(SessionData& session)
+{
+    size_t fpsSamples = 0;
+    for (const uint32_t count : session.fpsHistogramCounts)
+        fpsSamples += count;
+    if (fpsSamples > 0) {
+        size_t remaining = (std::max)(
+            static_cast<size_t>(1),
+            static_cast<size_t>(std::ceil(static_cast<double>(fpsSamples) * 0.01)));
+        double sum = 0.0;
+        const size_t requested = remaining;
+        for (size_t index = 0; index < kFpsHistogramBins && remaining > 0; ++index) {
+            const size_t count = session.fpsHistogramCounts[index];
+            if (count == 0)
+                continue;
+            const size_t take = (std::min)(remaining, count);
+            sum += session.fpsHistogramSums[index] *
+                static_cast<double>(take) / static_cast<double>(count);
+            remaining -= take;
+        }
+        session.onePercentLowFps = sum / static_cast<double>(requested);
+        session.hasOnePercentLowFps = true;
+    }
+    session.powerCoveragePercent = session.totalSampleCount > 0
+        ? static_cast<double>(session.validPowerSampleCount) * 100.0 /
+            static_cast<double>(session.totalSampleCount)
+        : 0.0;
+    session.statisticsAuthoritative = true;
+}
+
 void CalculateSessionStatistics(SessionData& session)
 {
+    session.energyWh = 0.0;
+    session.energyIncludesEstimate = false;
+    session.powerCoveragePercent = 0.0;
+    session.validSampleDurationSeconds = 0.0;
+    session.onePercentLowFps = 0.0;
+    session.hasOnePercentLowFps = false;
     for (size_t index = 0; index < static_cast<size_t>(MetricId::Count); ++index) {
         session.statistics[index] = CalculateStatistics(
             session.samples, static_cast<MetricId>(index));
@@ -462,6 +580,8 @@ void CalculateSessionStatistics(SessionData& session)
         if (!sample.systemPowerValid)
             continue;
         ++validPowerSamples;
+        session.energyIncludesEstimate =
+            session.energyIncludesEstimate || sample.systemPowerEstimated;
         if (havePreviousPower && previousPower) {
             const double elapsedSeconds = sample.elapsedSeconds - previousPower->elapsedSeconds;
             if (elapsedSeconds > 0.0 && elapsedSeconds <= 3.0) {
@@ -495,6 +615,9 @@ void CalculateSessionStatistics(SessionData& session)
     }
     if (foundFirst)
         session.validSampleDurationSeconds = (std::max)(0.0, lastElapsed - firstElapsed);
+    session.totalSampleCount = session.samples.size();
+    session.validPowerSampleCount = validPowerSamples;
+    session.statisticsAuthoritative = true;
 }
 
 #if defined(FPSOVERLAY_UI_QA)
@@ -519,6 +642,10 @@ bool RunStatisticsSelfTest()
         session.samples.push_back(sample);
     }
     CalculateSessionStatistics(session);
+    SessionData liveSession;
+    for (const GameSessionSample& sample : session.samples)
+        AccumulateLiveSample(liveSession, sample);
+    FinalizeLiveStatistics(liveSession);
 
     const MetricStatistics& fps =
         session.statistics[static_cast<size_t>(MetricId::Fps)];
@@ -535,7 +662,14 @@ bool RunStatisticsSelfTest()
            std::fabs(temperature.minimum - 50.0) < 0.0001 &&
            std::fabs(temperature.maximum - 70.0) < 0.0001 &&
            std::fabs(session.energyWh - expectedEnergyWh) < 0.000001 &&
-           session.energyIncludesEstimate;
+           session.energyIncludesEstimate &&
+           liveSession.totalSampleCount == session.samples.size() &&
+           liveSession.statistics[static_cast<size_t>(MetricId::Fps)].validSamples ==
+               fps.validSamples &&
+           std::fabs(liveSession.statistics[static_cast<size_t>(MetricId::Fps)].average -
+                     fps.average) < 0.0001 &&
+           std::fabs(liveSession.energyWh - session.energyWh) < 0.000001 &&
+           std::fabs(liveSession.onePercentLowFps - session.onePercentLowFps) < 0.0001;
 }
 #endif
 
@@ -552,6 +686,30 @@ std::string CsvEscape(const std::string& value)
     }
     escaped += '\"';
     return escaped;
+}
+
+bool StartsWithSpreadsheetFormula(const std::string& value)
+{
+    if (value.empty())
+        return false;
+    const unsigned char first = static_cast<unsigned char>(value.front());
+    return first == '=' || first == '+' || first == '-' || first == '@' ||
+           first == '\t' || first == '\r';
+}
+
+std::string CsvExternalText(const std::string& value)
+{
+    return CsvEscape(StartsWithSpreadsheetFormula(value)
+        ? std::string("'") + value : value);
+}
+
+std::string DecodeCsvExternalText(const std::string& value)
+{
+    if (value.size() >= 2 && value.front() == '\'' &&
+        StartsWithSpreadsheetFormula(value.substr(1))) {
+        return value.substr(1);
+    }
+    return value;
 }
 
 std::string NumberOrNa(bool valid, double value, int precision = 2)
@@ -583,34 +741,50 @@ const char* MetricName(MetricId metric)
     }
 }
 
+bool MetricIdFromName(const std::string& name, MetricId& metric)
+{
+    for (size_t index = 0; index < static_cast<size_t>(MetricId::Count); ++index) {
+        const MetricId candidate = static_cast<MetricId>(index);
+        if (name == MetricName(candidate)) {
+            metric = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string BuildCsv(const SessionData& session)
 {
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << "游戏会话概要\r\n";
     output << "字段,值\r\n";
-    output << "游戏名称," << CsvEscape(session.gameName) << "\r\n";
-    output << "游戏进程," << CsvEscape(session.processName) << "\r\n";
+    output << "游戏名称," << CsvExternalText(session.gameName) << "\r\n";
+    output << "游戏进程," << CsvExternalText(session.processName) << "\r\n";
     output << "游戏 PID," << session.processId << "\r\n";
     output << "开始时间," << CsvEscape(FormatLocalTime(session.startLocal)) << "\r\n";
     output << "结束时间," << CsvEscape(FormatLocalTime(session.endLocal)) << "\r\n";
     output << "游戏时长," << CsvEscape(FormatDuration(session.durationSeconds)) << "\r\n";
+    output << "游戏时长(秒)," << std::fixed << std::setprecision(3)
+           << session.durationSeconds << "\r\n";
     output << "有效采样时长(秒)," << std::fixed << std::setprecision(1)
            << session.validSampleDurationSeconds << "\r\n";
     output << "功耗数据覆盖率(%)," << std::fixed << std::setprecision(1)
            << session.powerCoveragePercent << "\r\n";
+    output << "总采样次数," << session.totalSampleCount << "\r\n";
+    output << "曲线保留步长," << session.retainedSampleStride << "\r\n";
     output << (session.energyIncludesEstimate ? "估算用电量(度)," : "实际用电量(度),")
            << std::fixed << std::setprecision(6) << session.energyWh / 1000.0 << "\r\n";
     output << "样本上限保护," << (session.sampleLimitReached ? "已触发" : "未触发") << "\r\n\r\n";
 
     output << "硬件信息\r\n";
     output << "项目,值\r\n";
-    output << "Windows," << CsvEscape(session.hardware.windowsVersion) << "\r\n";
-    output << "CPU," << CsvEscape(session.hardware.cpuName) << "\r\n";
-    output << "GPU," << CsvEscape(session.hardware.gpuName) << "\r\n";
+    output << "Windows," << CsvExternalText(session.hardware.windowsVersion) << "\r\n";
+    output << "CPU," << CsvExternalText(session.hardware.cpuName) << "\r\n";
+    output << "GPU," << CsvExternalText(session.hardware.gpuName) << "\r\n";
     output << "总内存(GB)," << NumberOrNa(session.hardware.totalMemoryGb > 0.0,
                                             session.hardware.totalMemoryGb, 2) << "\r\n";
-    output << "显示器," << CsvEscape(session.hardware.displayMode) << "\r\n\r\n";
+    output << "显示器," << CsvExternalText(session.hardware.displayMode) << "\r\n\r\n";
 
     output << "指标统计\r\n";
     output << "指标,平均值,最低值,最高值,有效样本数\r\n";
@@ -624,8 +798,8 @@ std::string BuildCsv(const SessionData& session)
                << NumberOrNa(valid, stats.maximum) << ','
                << stats.validSamples << "\r\n";
     }
-    output << "FPS 1% Low," << NumberOrNa(session.hasOnePercentLowFps,
-                                            session.onePercentLowFps) << ",,,\r\n\r\n";
+    output << "FPS 1% Low（逐秒样本）," << NumberOrNa(session.hasOnePercentLowFps,
+                                                        session.onePercentLowFps) << ",,,\r\n\r\n";
 
     output << "逐秒样本\r\n";
     output << "经过时间(秒),FPS,CPU占用(%),CPU温度(°C),CPU功耗(W),"
@@ -677,8 +851,34 @@ std::filesystem::path BuildCsvPath(const SessionData& session)
                session.startLocal.wYear, session.startLocal.wMonth,
                session.startLocal.wDay, session.startLocal.wHour,
                session.startLocal.wMinute, session.startLocal.wSecond);
-    return ReportDirectory() /
+    const std::filesystem::path basePath = ReportDirectory() /
         (std::wstring(timestamp) + L"_" + SanitizeFilename(session.processName) + L".csv");
+    static std::mutex reservationMutex;
+    static std::deque<std::pair<std::filesystem::path, ULONGLONG>> reservations;
+    const ULONGLONG now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(reservationMutex);
+    while (!reservations.empty() && now - reservations.front().second > 60000)
+        reservations.pop_front();
+
+    const std::wstring stem = basePath.stem().wstring();
+    for (unsigned int sequence = 1; sequence <= 9999; ++sequence) {
+        const std::filesystem::path candidate = sequence == 1
+            ? basePath
+            : basePath.parent_path() /
+                (stem + L"_" + std::to_wstring(sequence) + basePath.extension().wstring());
+        const bool reserved = std::any_of(
+            reservations.begin(), reservations.end(),
+            [&candidate](const auto& entry) { return entry.first == candidate; });
+        std::error_code fileError;
+        if (!reserved && !std::filesystem::exists(candidate, fileError) && !fileError) {
+            reservations.emplace_back(candidate, now);
+            return candidate;
+        }
+    }
+    const std::filesystem::path fallback = basePath.parent_path() /
+        (stem + L"_" + std::to_wstring(GetTickCount64()) + basePath.extension().wstring());
+    reservations.emplace_back(fallback, now);
+    return fallback;
 }
 
 bool WriteCsvSafely(const SessionData& session, std::string& error)
@@ -711,8 +911,7 @@ bool WriteCsvSafely(const SessionData& session, std::string& error)
         }
     }
 
-    if (!MoveFileExW(temporary.c_str(), session.csvPath.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!MoveFileExW(temporary.c_str(), session.csvPath.c_str(), MOVEFILE_WRITE_THROUGH)) {
         const DWORD code = GetLastError();
         error = "提交报告文件失败，Windows 错误码 " + std::to_string(code);
         std::filesystem::remove(temporary, fileError);
@@ -731,6 +930,42 @@ void NormalizeCsvLine(std::string& line)
         static_cast<unsigned char>(line[2]) == 0xBF) {
         line.erase(0, 3);
     }
+}
+
+bool HistoryFileSizeAllowed(const std::filesystem::path& path,
+                            uintmax_t* sizeOut,
+                            std::string& error)
+{
+    std::error_code fileError;
+    const uintmax_t size = std::filesystem::file_size(path, fileError);
+    if (fileError) {
+        error = "无法读取历史报告文件大小";
+        return false;
+    }
+    if (size == 0 || size > kMaxHistoryFileBytes) {
+        error = "历史报告文件为空或超过 16 MB 安全上限";
+        return false;
+    }
+    if (sizeOut)
+        *sizeOut = size;
+    return true;
+}
+
+bool ReadBoundedCsvLine(std::ifstream& file, std::string& line,
+                        std::string& error)
+{
+    line.clear();
+    char character = 0;
+    while (file.get(character)) {
+        if (character == '\n')
+            return true;
+        if (line.size() >= kMaxCsvLineBytes) {
+            error = "CSV 单行超过 64 KB 安全上限";
+            return false;
+        }
+        line.push_back(character);
+    }
+    return !line.empty();
 }
 
 std::vector<std::string> ParseCsvRow(const std::string& line)
@@ -823,6 +1058,8 @@ bool ParseLocalTimeText(const std::string& text, SYSTEMTIME& value)
 bool ReadHistoryEntry(const std::filesystem::path& path,
                       HistoryEntry& entry, std::string& error)
 {
+    if (!HistoryFileSizeAllowed(path, nullptr, error))
+        return false;
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         error = "无法读取历史报告";
@@ -838,7 +1075,15 @@ bool ReadHistoryEntry(const std::filesystem::path& path,
     bool inStatistics = false;
     std::string line;
     size_t inspectedLines = 0;
-    while (inspectedLines++ < 96 && std::getline(file, line)) {
+    while (inspectedLines++ < 96) {
+        std::string lineError;
+        if (!ReadBoundedCsvLine(file, line, lineError)) {
+            if (!lineError.empty()) {
+                error = lineError;
+                return false;
+            }
+            break;
+        }
         NormalizeCsvLine(line);
         if (line == "指标统计") {
             inStatistics = true;
@@ -850,9 +1095,9 @@ bool ReadHistoryEntry(const std::filesystem::path& path,
         if (fields.size() < 2)
             continue;
         if (fields[0] == "游戏名称")
-            entry.gameName = fields[1];
+            entry.gameName = DecodeCsvExternalText(fields[1]);
         else if (fields[0] == "游戏进程")
-            entry.processName = fields[1];
+            entry.processName = DecodeCsvExternalText(fields[1]);
         else if (fields[0] == "开始时间")
             entry.startTime = fields[1];
         else if (fields[0] == "游戏时长")
@@ -872,6 +1117,7 @@ std::vector<HistoryEntry> ScanHistoryEntries(std::string& error)
     };
 
     std::vector<Candidate> candidates;
+    candidates.reserve(kMaxHistoryEntries);
     std::error_code fileError;
     const std::filesystem::path directory = ReportDirectory();
     if (!std::filesystem::exists(directory, fileError))
@@ -881,6 +1127,7 @@ std::vector<HistoryEntry> ScanHistoryEntries(std::string& error)
         return {};
     }
 
+    size_t inspectedFiles = 0;
     for (std::filesystem::directory_iterator iterator(directory, fileError), end;
          !fileError && iterator != end; iterator.increment(fileError)) {
         const std::filesystem::directory_entry& item = *iterator;
@@ -890,6 +1137,10 @@ std::vector<HistoryEntry> ScanHistoryEntries(std::string& error)
         const std::wstring extension = item.path().extension().wstring();
         if (_wcsicmp(extension.c_str(), L".csv") != 0)
             continue;
+        if (++inspectedFiles > kMaxHistoryFilesInspected) {
+            error = "历史报告超过 10,000 份，只扫描了安全上限内的文件";
+            break;
+        }
         Candidate candidate;
         candidate.path = item.path();
         candidate.modifiedTime = item.last_write_time(itemError);
@@ -897,9 +1148,23 @@ std::vector<HistoryEntry> ScanHistoryEntries(std::string& error)
             candidate.modifiedTime = {};
         itemError.clear();
         candidate.sizeBytes = item.file_size(itemError);
-        if (itemError)
-            candidate.sizeBytes = 0;
-        candidates.push_back(std::move(candidate));
+        if (itemError || candidate.sizeBytes == 0 ||
+            candidate.sizeBytes > kMaxHistoryFileBytes) {
+            continue;
+        }
+        if (candidates.size() < kMaxHistoryEntries) {
+            candidates.push_back(std::move(candidate));
+        } else {
+            auto oldest = std::min_element(
+                candidates.begin(), candidates.end(),
+                [](const Candidate& left, const Candidate& right) {
+                    return left.modifiedTime < right.modifiedTime;
+                });
+            if (oldest != candidates.end() &&
+                candidate.modifiedTime > oldest->modifiedTime) {
+                *oldest = std::move(candidate);
+            }
+        }
     }
     if (fileError) {
         error = "扫描历史报告失败：" + fileError.message();
@@ -910,9 +1175,6 @@ std::vector<HistoryEntry> ScanHistoryEntries(std::string& error)
               [](const Candidate& left, const Candidate& right) {
                   return left.modifiedTime > right.modifiedTime;
               });
-    if (candidates.size() > kMaxHistoryEntries)
-        candidates.resize(kMaxHistoryEntries);
-
     std::vector<HistoryEntry> entries;
     entries.reserve(candidates.size());
     size_t invalidFiles = 0;
@@ -935,6 +1197,8 @@ std::vector<HistoryEntry> ScanHistoryEntries(std::string& error)
 std::shared_ptr<SessionData> LoadSessionCsv(const std::filesystem::path& path,
                                             std::string& error)
 {
+    if (!HistoryFileSizeAllowed(path, nullptr, error))
+        return {};
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         error = "无法打开所选历史报告";
@@ -946,7 +1210,16 @@ std::shared_ptr<SessionData> LoadSessionCsv(const std::filesystem::path& path,
     auto session = std::make_shared<SessionData>();
     session->csvPath = path;
     std::string line;
-    while (std::getline(file, line)) {
+    size_t parsedStatisticsRows = 0;
+    while (true) {
+        std::string lineError;
+        if (!ReadBoundedCsvLine(file, line, lineError)) {
+            if (!lineError.empty()) {
+                error = lineError;
+                return {};
+            }
+            break;
+        }
         NormalizeCsvLine(line);
         if (line == "硬件信息") {
             section = Section::Hardware;
@@ -966,9 +1239,9 @@ std::shared_ptr<SessionData> LoadSessionCsv(const std::filesystem::path& path,
             continue;
         if (section == Section::Summary) {
             if (fields[0] == "游戏名称")
-                session->gameName = fields[1];
+                session->gameName = DecodeCsvExternalText(fields[1]);
             else if (fields[0] == "游戏进程")
-                session->processName = fields[1];
+                session->processName = DecodeCsvExternalText(fields[1]);
             else if (fields[0] == "游戏 PID") {
                 unsigned long processId = 0;
                 if (ParseUnsignedNumber(fields[1], processId))
@@ -977,6 +1250,26 @@ std::shared_ptr<SessionData> LoadSessionCsv(const std::filesystem::path& path,
                 ParseLocalTimeText(fields[1], session->startLocal);
             } else if (fields[0] == "结束时间") {
                 ParseLocalTimeText(fields[1], session->endLocal);
+            } else if (fields[0] == "游戏时长(秒)") {
+                ParseNumber(fields[1], session->durationSeconds);
+            } else if (fields[0] == "有效采样时长(秒)") {
+                ParseNumber(fields[1], session->validSampleDurationSeconds);
+            } else if (fields[0] == "功耗数据覆盖率(%)") {
+                ParseNumber(fields[1], session->powerCoveragePercent);
+            } else if (fields[0] == "总采样次数") {
+                unsigned long count = 0;
+                if (ParseUnsignedNumber(fields[1], count))
+                    session->totalSampleCount = static_cast<size_t>(count);
+            } else if (fields[0] == "曲线保留步长") {
+                unsigned long stride = 0;
+                if (ParseUnsignedNumber(fields[1], stride) && stride > 0)
+                    session->retainedSampleStride = static_cast<size_t>(stride);
+            } else if (fields[0].find("用电量") != std::string::npos) {
+                double energy = 0.0;
+                if (ParseNumber(fields[1], energy))
+                    session->energyWh = energy * 1000.0;
+                session->energyIncludesEstimate =
+                    fields[0].find("估算") != std::string::npos;
             } else if (fields[0] == "样本上限保护") {
                 session->sampleLimitReached = fields[1] == "已触发";
             }
@@ -984,17 +1277,41 @@ std::shared_ptr<SessionData> LoadSessionCsv(const std::filesystem::path& path,
         }
         if (section == Section::Hardware) {
             if (fields[0] == "Windows")
-                session->hardware.windowsVersion = fields[1];
+                session->hardware.windowsVersion = DecodeCsvExternalText(fields[1]);
             else if (fields[0] == "CPU")
-                session->hardware.cpuName = fields[1];
+                session->hardware.cpuName = DecodeCsvExternalText(fields[1]);
             else if (fields[0] == "GPU")
-                session->hardware.gpuName = fields[1];
+                session->hardware.gpuName = DecodeCsvExternalText(fields[1]);
             else if (fields[0] == "总内存(GB)") {
                 double totalMemory = 0.0;
                 if (ParseNumber(fields[1], totalMemory) && totalMemory > 0.0)
                     session->hardware.totalMemoryGb = totalMemory;
             } else if (fields[0] == "显示器") {
-                session->hardware.displayMode = fields[1];
+                session->hardware.displayMode = DecodeCsvExternalText(fields[1]);
+            }
+            continue;
+        }
+        if (section == Section::Statistics) {
+            if (fields[0].rfind("FPS 1% Low", 0) == 0) {
+                session->hasOnePercentLowFps =
+                    ParseNumber(fields[1], session->onePercentLowFps);
+                continue;
+            }
+            if (fields.size() >= 5) {
+                MetricId metric = MetricId::Count;
+                if (MetricIdFromName(fields[0], metric)) {
+                    MetricStatistics statistics;
+                    unsigned long validSamples = 0;
+                    const bool averageValid = ParseNumber(fields[1], statistics.average);
+                    const bool minimumValid = ParseNumber(fields[2], statistics.minimum);
+                    const bool maximumValid = ParseNumber(fields[3], statistics.maximum);
+                    const bool countValid = ParseUnsignedNumber(fields[4], validSamples);
+                    if (averageValid && minimumValid && maximumValid && countValid) {
+                        statistics.validSamples = static_cast<size_t>(validSamples);
+                        session->statistics[static_cast<size_t>(metric)] = statistics;
+                    }
+                    ++parsedStatisticsRows;
+                }
             }
             continue;
         }
@@ -1053,8 +1370,15 @@ std::shared_ptr<SessionData> LoadSessionCsv(const std::filesystem::path& path,
         session->processName = WideToUtf8(path.stem().wstring());
     if (session->gameName.empty())
         session->gameName = session->processName;
-    session->durationSeconds = session->samples.back().elapsedSeconds;
-    CalculateSessionStatistics(*session);
+    if (session->durationSeconds <= 0.0)
+        session->durationSeconds = session->samples.back().elapsedSeconds;
+    if (session->totalSampleCount == 0)
+        session->totalSampleCount = session->samples.size();
+    if (parsedStatisticsRows >= static_cast<size_t>(MetricId::Count)) {
+        session->statisticsAuthoritative = true;
+    } else {
+        CalculateSessionStatistics(*session);
+    }
     return session;
 }
 
@@ -1437,7 +1761,19 @@ struct GameSessionReportFeature::Impl {
             historyError.clear();
         }
         try {
-            historyThread = std::thread([this]() { HistoryWorkerLoop(); });
+            historyThread = std::thread([this]() {
+                try {
+                    HistoryWorkerLoop();
+                } catch (const std::exception& exception) {
+                    std::lock_guard<std::mutex> lock(historyMutex);
+                    historyBusy = false;
+                    historyError = std::string("历史记录线程异常停止：") + exception.what();
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(historyMutex);
+                    historyBusy = false;
+                    historyError = "历史记录线程异常停止";
+                }
+            });
             historyStarted = true;
         } catch (const std::exception& exception) {
             std::lock_guard<std::mutex> lock(historyMutex);
@@ -1617,11 +1953,27 @@ struct GameSessionReportFeature::Impl {
         if (!activeSession || now - activeSession->lastSampleTick < kSampleIntervalMs)
             return;
         activeSession->lastSampleTick = now;
+        GameSessionSample sample = MakeSample(context, now);
+        AccumulateLiveSample(*activeSession, sample);
         if (activeSession->samples.size() >= kMaxSamples) {
             activeSession->sampleLimitReached = true;
-            return;
+            size_t writeIndex = 0;
+            for (size_t readIndex = 0;
+                 readIndex < activeSession->samples.size(); readIndex += 2) {
+                if (writeIndex != readIndex) {
+                    activeSession->samples[writeIndex] =
+                        std::move(activeSession->samples[readIndex]);
+                }
+                ++writeIndex;
+            }
+            activeSession->samples.resize(writeIndex);
+            activeSession->retainedSampleStride = (std::min)(
+                activeSession->retainedSampleStride * 2,
+                static_cast<size_t>(1u << 20));
         }
-        activeSession->samples.push_back(MakeSample(context, now));
+        const size_t sampleOrdinal = activeSession->totalSampleCount - 1;
+        if (sampleOrdinal % activeSession->retainedSampleStride == 0)
+            activeSession->samples.push_back(std::move(sample));
     }
 
     bool EnsureWriterStartedLocked()
@@ -1712,7 +2064,10 @@ struct GameSessionReportFeature::Impl {
         if (session.hardware.totalMemoryGb <= 0.0)
             session.hardware.totalMemoryGb = latestHardware.totalMemoryGb;
 
-        CalculateSessionStatistics(session);
+        if (session.totalSampleCount > 0)
+            FinalizeLiveStatistics(session);
+        else
+            CalculateSessionStatistics(session);
         session.csvPath = BuildCsvPath(session);
         auto completed = std::shared_ptr<SessionData>(std::move(activeSession));
         lastCompletedSession = completed;
@@ -1952,8 +2307,8 @@ struct GameSessionReportFeature::Impl {
         Impl test;
         auto session = std::make_shared<SessionData>();
         session->processId = GetCurrentProcessId();
-        session->processName = "测试游戏.exe";
-        session->gameName = "中文路径 QA";
+        session->processName = "@测试游戏.exe";
+        session->gameName = "=1+1 中文路径 QA";
         session->startLocal = CurrentLocalTime();
         session->endLocal = session->startLocal;
         session->durationSeconds = 1.0;
@@ -1967,6 +2322,13 @@ struct GameSessionReportFeature::Impl {
         const bool energyUnitValid =
             csvText.find("实际用电量(度),") != std::string::npos &&
             csvText.find("用电量(kWh)") == std::string::npos;
+        const bool formulaEscapingValid =
+            csvText.find("游戏名称,'=1+1 中文路径 QA") != std::string::npos &&
+            csvText.find("游戏进程,'@测试游戏.exe") != std::string::npos;
+        const std::filesystem::path firstCollisionPath = BuildCsvPath(*session);
+        const std::filesystem::path secondCollisionPath = BuildCsvPath(*session);
+        const bool collisionProtectionValid =
+            firstCollisionPath != secondCollisionPath;
         session->csvPath = ReportDirectory() /
             (L"QA_中文路径_" + std::to_wstring(GetCurrentProcessId()) + L".csv");
         test.QueueCsv(session);
@@ -1987,7 +2349,8 @@ struct GameSessionReportFeature::Impl {
             ReadHistoryEntry(session->csvPath, historyEntry, entryReadError);
         std::error_code removeError;
         std::filesystem::remove(session->csvPath, removeError);
-        return validBom && energyUnitValid && test.lastWriterError.empty() && loaded &&
+        return validBom && energyUnitValid && formulaEscapingValid &&
+               collisionProtectionValid && test.lastWriterError.empty() && loaded &&
                loaded->gameName == session->gameName &&
                loaded->processName == session->processName &&
                loaded->samples.size() == session->samples.size() &&
@@ -2381,7 +2744,7 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
         if (report->sampleLimitReached) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextColored(SettingsUi::Warning(),
-                               "本局超过 8 小时样本上限，曲线只保留前 28,800 个逐秒样本。");
+                               "长时会话曲线已自动降采样；统计、功耗覆盖率和耗电量仍基于完整逐秒样本。");
             ImGui::PopTextWrapPos();
         }
         const std::string csvPath = WideToUtf8(report->csvPath.wstring());
@@ -2446,8 +2809,8 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
     const MetricStatistics& systemPower = Stats(*report, MetricId::SystemPower);
     const std::string fpsValue = FormatMetricAverage(fps, "", 1);
     const std::string fpsDetail = report->hasOnePercentLowFps
-        ? "1% Low " + NumberOrNa(true, report->onePercentLowFps, 1)
-        : "1% Low N/A";
+        ? "逐秒 1% Low " + NumberOrNa(true, report->onePercentLowFps, 1)
+        : "逐秒 1% Low N/A";
     const std::string cpuValue = FormatMetricAverage(cpuUsage, "%", 1);
     const std::string cpuDetail =
         "平均温度 " + FormatMetricAverage(cpuTemperature, "°C", 1);

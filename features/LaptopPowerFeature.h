@@ -119,6 +119,8 @@ private:
     float cachedDischargeW_ = 0.0f;
     std::thread batteryPollThread_;
     std::atomic<bool> batteryPollInFlight_{false};
+    std::atomic<bool> batteryIoAbandoned_{false};
+    std::atomic<bool> shuttingDown_{false};
     std::mutex batteryResultMutex_;
     BatteryRateResult pendingBatteryResult_;
     bool pendingBatteryResultReady_ = false;

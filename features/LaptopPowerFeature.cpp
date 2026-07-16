@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -378,6 +379,45 @@ float LaptopPowerFeature::SmoothEstimate(float rawValue,
 LaptopPowerFeature::BatteryRateResult LaptopPowerFeature::QueryWindowsBatteryRate()
 {
     BatteryRateResult result;
+    if (batteryIoAbandoned_.load(std::memory_order_acquire))
+        return result;
+
+    auto deviceIoControlWithTimeout = [this](
+        HANDLE& handle, DWORD controlCode, void* input, DWORD inputBytes,
+        void* output, DWORD outputBytes, DWORD* bytesReturned) {
+        auto overlapped = std::make_unique<OVERLAPPED>();
+        overlapped->hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!overlapped->hEvent)
+            return false;
+
+        BOOL completed = DeviceIoControl(
+            handle, controlCode, input, inputBytes, output, outputBytes,
+            bytesReturned, overlapped.get());
+        if (!completed && GetLastError() == ERROR_IO_PENDING) {
+            const DWORD waitResult = WaitForSingleObject(
+                overlapped->hEvent, 1500);
+            if (waitResult == WAIT_OBJECT_0) {
+                completed = GetOverlappedResult(
+                    handle, overlapped.get(), bytesReturned, FALSE);
+            } else {
+                CancelIoEx(handle, overlapped.get());
+                CloseHandle(handle);
+                handle = INVALID_HANDLE_VALUE;
+                const DWORD cancelWait = WaitForSingleObject(
+                    overlapped->hEvent, 1500);
+                if (cancelWait != WAIT_OBJECT_0) {
+                    batteryIoAbandoned_.store(true, std::memory_order_release);
+                    // The driver still owns this OVERLAPPED. Keep the single
+                    // context alive for process lifetime and stop future polls.
+                    overlapped.release();
+                    return false;
+                }
+                completed = FALSE;
+            }
+        }
+        CloseHandle(overlapped->hEvent);
+        return completed != FALSE;
+    };
 
     HDEVINFO devInfo = SetupDiGetClassDevs(&kBatteryDeviceGuid, nullptr, nullptr,
                                            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -387,7 +427,11 @@ LaptopPowerFeature::BatteryRateResult LaptopPowerFeature::QueryWindowsBatteryRat
     SP_DEVICE_INTERFACE_DATA iface = {};
     iface.cbSize = sizeof(iface);
 
-    for (DWORD index = 0; SetupDiEnumDeviceInterfaces(devInfo, nullptr, &kBatteryDeviceGuid, index, &iface); ++index) {
+    for (DWORD index = 0;
+         index < 8 && !shuttingDown_.load(std::memory_order_acquire) &&
+         SetupDiEnumDeviceInterfaces(
+             devInfo, nullptr, &kBatteryDeviceGuid, index, &iface);
+         ++index) {
         DWORD needed = 0;
         SetupDiGetDeviceInterfaceDetail(devInfo, &iface, nullptr, 0, &needed, nullptr);
         if (needed == 0)
@@ -405,25 +449,28 @@ LaptopPowerFeature::BatteryRateResult LaptopPowerFeature::QueryWindowsBatteryRat
 
         HANDLE hBattery = CreateFile(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
                                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                                     FILE_ATTRIBUTE_NORMAL, nullptr);
+                                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
         free(detail);
         if (hBattery == INVALID_HANDLE_VALUE)
             continue;
 
         BATTERY_QUERY_INFORMATION query = {};
         DWORD bytes = 0;
-        if (!DeviceIoControl(hBattery, IOCTL_BATTERY_QUERY_TAG, nullptr, 0,
-                             &query.BatteryTag, sizeof(query.BatteryTag), &bytes, nullptr) ||
+        if (!deviceIoControlWithTimeout(
+                hBattery, IOCTL_BATTERY_QUERY_TAG, nullptr, 0,
+                &query.BatteryTag, sizeof(query.BatteryTag), &bytes) ||
             query.BatteryTag == 0) {
-            CloseHandle(hBattery);
+            if (hBattery != INVALID_HANDLE_VALUE)
+                CloseHandle(hBattery);
             continue;
         }
 
         BATTERY_WAIT_STATUS wait = {};
         wait.BatteryTag = query.BatteryTag;
         BATTERY_STATUS status = {};
-        if (DeviceIoControl(hBattery, IOCTL_BATTERY_QUERY_STATUS,
-                            &wait, sizeof(wait), &status, sizeof(status), &bytes, nullptr)) {
+        if (deviceIoControlWithTimeout(
+                hBattery, IOCTL_BATTERY_QUERY_STATUS, &wait, sizeof(wait),
+                &status, sizeof(status), &bytes)) {
             result.statusAvailable = true;
 
             const LONG rate = status.Rate;
@@ -444,7 +491,8 @@ LaptopPowerFeature::BatteryRateResult LaptopPowerFeature::QueryWindowsBatteryRat
                 result.idle = true;
             }
         }
-        CloseHandle(hBattery);
+        if (hBattery != INVALID_HANDLE_VALUE)
+            CloseHandle(hBattery);
         if (result.statusAvailable)
             break;
     }
@@ -483,20 +531,29 @@ void LaptopPowerFeature::ApplyCompletedBatteryPoll()
 
 void LaptopPowerFeature::ScheduleBatteryPoll()
 {
+    if (shuttingDown_.load(std::memory_order_acquire))
+        return;
     if (batteryPollInFlight_.exchange(true, std::memory_order_acq_rel))
         return;
     if (batteryPollThread_.joinable())
         batteryPollThread_.join();
 
-    batteryPollThread_ = std::thread([this]() {
-        const BatteryRateResult result = QueryWindowsBatteryRate();
-        {
-            std::lock_guard<std::mutex> lock(batteryResultMutex_);
-            pendingBatteryResult_ = result;
-            pendingBatteryResultReady_ = true;
-        }
+    try {
+        batteryPollThread_ = std::thread([this]() {
+            try {
+                const BatteryRateResult result = QueryWindowsBatteryRate();
+                if (!shuttingDown_.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lock(batteryResultMutex_);
+                    pendingBatteryResult_ = result;
+                    pendingBatteryResultReady_ = true;
+                }
+            } catch (...) {
+            }
+            batteryPollInFlight_.store(false, std::memory_order_release);
+        });
+    } catch (...) {
         batteryPollInFlight_.store(false, std::memory_order_release);
-    });
+    }
 }
 
 void LaptopPowerFeature::Update(FeatureContext& context)
@@ -772,6 +829,8 @@ void LaptopPowerFeature::Update(FeatureContext& context)
 
 bool LaptopPowerFeature::StartComparisonRecording()
 {
+    if (shuttingDown_.load(std::memory_order_acquire))
+        return false;
     if (comparisonRecording_)
         return true;
 
@@ -883,7 +942,20 @@ bool LaptopPowerFeature::StartComparisonRecording()
         comparisonWriterStop_ = false;
     }
     comparisonWriterFailed_.store(false, std::memory_order_release);
-    comparisonWriterThread_ = std::thread(&LaptopPowerFeature::ComparisonWriterMain, this);
+    try {
+        comparisonWriterThread_ = std::thread(
+            &LaptopPowerFeature::ComparisonWriterMain, this);
+    } catch (...) {
+        snprintf(comparisonError_, sizeof(comparisonError_),
+                 "%s", "无法启动 CSV 写入线程");
+        comparisonStream_.close();
+        comparisonFilePathW_.clear();
+        comparisonFilePathUtf8_[0] = '\0';
+        std::lock_guard<std::mutex> lock(comparisonWriterMutex_);
+        comparisonWriterQueue_.clear();
+        comparisonWriterStop_ = true;
+        return false;
+    }
     comparisonRecording_ = true;
     return true;
 }
@@ -1030,6 +1102,11 @@ void LaptopPowerFeature::RecordComparisonSample(
 
     {
         std::lock_guard<std::mutex> lock(comparisonWriterMutex_);
+        constexpr size_t kMaximumQueuedRows = 4096;
+        if (comparisonWriterQueue_.size() >= kMaximumQueuedRows) {
+            comparisonWriterFailed_.store(true, std::memory_order_release);
+            return;
+        }
         comparisonWriterQueue_.push_back(row.str());
     }
     comparisonWriterCv_.notify_one();
@@ -1037,6 +1114,7 @@ void LaptopPowerFeature::RecordComparisonSample(
 
 void LaptopPowerFeature::Shutdown()
 {
+    shuttingDown_.store(true, std::memory_order_release);
     StopComparisonRecording();
     if (batteryPollThread_.joinable())
         batteryPollThread_.join();

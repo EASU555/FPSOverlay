@@ -1027,3 +1027,21 @@
 - [x] 旧 `(kWh)` CSV 仍可由逐秒功耗样本重算耗电量，历史查看不需要迁移。
 - [x] 本次未修改能耗积分、会话采样、统计或 Overlay 绘制逻辑。
 - [x] Codex 未启动 v1.10.46 正式发布程序。
+
+## v1.10.47 对抗性审查修复
+
+- [x] 修改前已归档 v1.10.46 到 `旧版本归档\2026-07-16_2255_v1.10.46_对抗性修复前`。
+- [x] PawnIO 安装包使用随机受限目录、`CREATE_NEW`、写入刷盘和运行期句柄保持，旧的可预测 `%TEMP%` 写入实现已删除。
+- [x] 静态检查确认未知 ETW 进程需要前台游戏窗口、无边框整屏和持续呈现才能入选，普通最大化应用不会走该兜底。
+- [x] 历史报告读取设置 16 MiB 文件、64 KiB 行和 10,000 文件扫描上限，后台异常有顶层捕获。
+- [x] QA 统计自检同时比较批量重算与全量在线累积的平均 FPS、1% Low 和梯形功耗积分。
+- [x] QA 持久化自检覆盖 CSV 公式转义、中文回读、UTF-8 BOM 和同秒文件名冲突编号。
+- [x] 电池 IOCTL 超时可取消，功耗 CSV 队列上限为 4096 行，所有新增后台线程创建点均捕获失败。
+- [x] 配置临时文件在原子替换前检查写入结果、schema 和关键键；中文项目路径下使用 Unicode 文件 API。
+- [x] `FPSOVERLAY_UI_QA` v1.10.47 以 `/W4 /permissive- /Zi` 无警告编译通过；最终构建运行 4 秒保持响应，内置自检通过并经 `WM_CLOSE` 以代码 0 正常退出。
+- [x] Release x64 资源编译、C++ 编译、链接和 LTCG 以 `/W4 /permissive- /Zi` 无警告通过。
+- [x] Windows `FileVersion`、`ProductVersion` 和 Release/QA manifest 同步为 v1.10.47；Release 为 `requireAdministrator`，QA 为 `asInvoker`。
+- [x] Windows ZIP 只包含 `overlay.exe`、`lhwm-wrapper.dll` 和 `LibreHardwareMonitorLib.dll`；源码 ZIP 包含 124 个 Git 跟踪文件，不包含构建产物、日志、配置和历史报告。
+- [x] 与修改前归档比较，游戏加加主绘制块、指标顺序和绘制样式无修改。
+- [ ] 用户在真实游戏、普通最大化应用和休眠唤醒场景复测目标识别与退出时延。
+- [x] Codex 未启动 v1.10.47 正式发布程序。

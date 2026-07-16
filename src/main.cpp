@@ -21,6 +21,8 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <sddl.h>
 #include <evntrace.h>
 #include <evntcons.h>
 #include <psapi.h>
@@ -58,6 +60,7 @@
 #pragma comment(lib, "PowrProf.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "taskschd.lib")
+#pragma comment(lib, "shell32.lib")
 
 // Note: Link with -lwbemuuid -lole32 -loleaut32 for WMI support
 // Note: Link with lhwm-cpp-wrapper.lib and mscoree.lib for LibreHardwareMonitor support
@@ -373,15 +376,20 @@ static void FormatNetworkRate(char* out, size_t outLen, double bytesPerSecond)
 // ═══════════════════════════════════════════════════════════════════════════
 // Configuration file (INI) - saved next to overlay.exe
 // ═══════════════════════════════════════════════════════════════════════════
-static char g_configPath[MAX_PATH] = "";
+static constexpr size_t kExtendedPathCapacity = 32768;
+static char g_configPath[kExtendedPathCapacity] = "";
+static std::wstring g_executablePathWide;
+static std::wstring g_configPathWide;
 static const int CONFIG_SCHEMA_VERSION = 1;
-static char g_lastConfigBackupPath[MAX_PATH] = "";
+static char g_lastConfigBackupPath[kExtendedPathCapacity] = "";
 static char g_lastConfigRecoveryReason[128] = "";
-static char g_logPath[MAX_PATH] = "";
+static char g_logPath[kExtendedPathCapacity] = "";
+static std::wstring g_logPathWide;
 static std::mutex g_logMutex;
 static std::mutex g_lhwmStateMutex;
 static std::mutex g_configIoMutex;
-static thread_local const char* g_iniWritePath = nullptr;
+static thread_local const wchar_t* g_iniWritePath = nullptr;
+static thread_local bool g_iniWriteSucceeded = true;
 static bool g_ConfigDirty = false;
 static ULONGLONG g_ConfigDirtyTick = 0;
 static FeatureRegistry g_FeatureRegistry;
@@ -392,24 +400,81 @@ static std::atomic<bool> g_trayShowBatteryPower{true};
 static std::atomic<bool> g_trayAllowEstimatedPower{true};
 static std::atomic<bool> g_trayDesktopOnlyMode{false};
 // Written when PawnIO_setup succeeds; survives config.ini being rewritten or stripped.
-static char g_pawnioRebootStatePath[MAX_PATH] = "";
+static char g_pawnioRebootStatePath[kExtendedPathCapacity] = "";
+static std::wstring g_pawnioRebootStatePathWide;
+
+static std::string WideToUtf8PathText(const std::wstring& value)
+{
+    if (value.empty())
+        return {};
+    const int length = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(),
+        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (length <= 0)
+        return {};
+    std::string result(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(),
+                        static_cast<int>(value.size()), result.data(), length,
+                        nullptr, nullptr);
+    return result;
+}
+
+static std::wstring Utf8ToWidePathText(const char* value)
+{
+    if (!value || !value[0])
+        return {};
+    int length = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
+    if (length <= 0)
+        length = MultiByteToWideChar(CP_ACP, 0, value, -1, nullptr, 0);
+    if (length <= 0)
+        return {};
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1,
+                             result.data(), length)) {
+        MultiByteToWideChar(CP_ACP, 0, value, -1, result.data(), length);
+    }
+    result.resize(wcslen(result.c_str()));
+    return result;
+}
+
+static void CopyWidePathAsUtf8(
+    const std::wstring& path, char* destination, size_t capacity)
+{
+    if (!destination || capacity == 0)
+        return;
+    const std::string utf8 = WideToUtf8PathText(path);
+    snprintf(destination, capacity, "%s", utf8.c_str());
+}
 
 static void InitConfigPath()
 {
-    if (g_configPath[0] != '\0') return; // already initialized
-    
-    // Get the directory where the executable is located
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    
-    // Remove the executable name to get the directory
-    char* lastSlash = strrchr(exePath, '\\');
-    if (lastSlash) *(lastSlash + 1) = '\0';
-    
-    // Append the config filename
-    snprintf(g_configPath, MAX_PATH, "%sconfig.ini", exePath);
-    snprintf(g_pawnioRebootStatePath, MAX_PATH, "%sfpsoverlay-pawnio-reboot.state", exePath);
-    snprintf(g_logPath, MAX_PATH, "%sfps-overlay.log", exePath);
+    static std::once_flag initializeOnce;
+    std::call_once(initializeOnce, []() {
+        std::vector<wchar_t> modulePath(kExtendedPathCapacity, L'\0');
+        DWORD length = GetModuleFileNameW(
+            nullptr, modulePath.data(), static_cast<DWORD>(modulePath.size()));
+        std::filesystem::path executableDirectory;
+        if (length > 0 && static_cast<size_t>(length) < modulePath.size()) {
+            g_executablePathWide = modulePath.data();
+            executableDirectory =
+                std::filesystem::path(g_executablePathWide).parent_path();
+        } else {
+            std::error_code currentDirectoryError;
+            executableDirectory =
+                std::filesystem::current_path(currentDirectoryError);
+        }
+        g_configPathWide = (executableDirectory / L"config.ini").wstring();
+        g_pawnioRebootStatePathWide =
+            (executableDirectory / L"fpsoverlay-pawnio-reboot.state").wstring();
+        g_logPathWide = (executableDirectory / L"fps-overlay.log").wstring();
+        CopyWidePathAsUtf8(
+            g_configPathWide, g_configPath, sizeof(g_configPath));
+        CopyWidePathAsUtf8(g_pawnioRebootStatePathWide,
+                           g_pawnioRebootStatePath,
+                           sizeof(g_pawnioRebootStatePath));
+        CopyWidePathAsUtf8(g_logPathWide, g_logPath, sizeof(g_logPath));
+    });
 }
 
 static void LogLine(const char* fmt, ...)
@@ -420,22 +485,22 @@ static void LogLine(const char* fmt, ...)
     static unsigned int sizeCheckCounter = 0;
     if ((sizeCheckCounter++ & 0xffu) == 0) {
         WIN32_FILE_ATTRIBUTE_DATA data = {};
-        if (GetFileAttributesExA(g_logPath, GetFileExInfoStandard, &data)) {
+        if (GetFileAttributesExW(
+                g_logPathWide.c_str(), GetFileExInfoStandard, &data)) {
             ULARGE_INTEGER size = {};
             size.HighPart = data.nFileSizeHigh;
             size.LowPart = data.nFileSizeLow;
             constexpr ULONGLONG kMaxLogBytes = 16ull * 1024ull * 1024ull;
             if (size.QuadPart >= kMaxLogBytes) {
-                char rotatedPath[MAX_PATH] = {};
-                snprintf(rotatedPath, sizeof(rotatedPath), "%s.previous.log", g_logPath);
-                MoveFileExA(g_logPath, rotatedPath,
+                const std::wstring rotatedPath = g_logPathWide + L".previous.log";
+                MoveFileExW(g_logPathWide.c_str(), rotatedPath.c_str(),
                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
             }
         }
     }
 
     FILE* f = nullptr;
-    if (fopen_s(&f, g_logPath, "ab") != 0 || !f)
+    if (_wfopen_s(&f, g_logPathWide.c_str(), L"ab") != 0 || !f)
         return;
 
     SYSTEMTIME st;
@@ -461,11 +526,13 @@ static void BuildTimestampSuffix(char* out, size_t cap)
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 }
 
-static bool ConfigFileLooksUsable(const char* path, char* reason, size_t reasonCap)
+static bool ConfigFileLooksUsable(
+    const wchar_t* path, char* reason, size_t reasonCap)
 {
     if (reason && reasonCap) reason[0] = '\0';
 
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    std::ifstream in(
+        std::filesystem::path(path), std::ios::binary | std::ios::ate);
     if (!in) {
         if (reason && reasonCap) snprintf(reason, reasonCap, "open_failed");
         return false;
@@ -501,6 +568,47 @@ static bool ConfigFileLooksUsable(const char* path, char* reason, size_t reasonC
     return true;
 }
 
+static bool ConfigFileHasRequiredSettings(
+    const wchar_t* path, char* reason, size_t reasonCap)
+{
+    struct RequiredSetting {
+        const wchar_t* section;
+        const wchar_t* key;
+        const char* diagnosticName;
+    };
+    static constexpr RequiredSetting requiredSettings[] = {
+        {L"App", L"schema_version", "App.schema_version"},
+        {L"App", L"app_version", "App.app_version"},
+        {L"Display", L"showFPS", "Display.showFPS"},
+        {L"Layout", L"layoutStyle", "Layout.layoutStyle"},
+        {L"Hotkeys", L"toggleKey", "Hotkeys.toggleKey"},
+        {L"Features", L"feature.game_session_report",
+         "Features.feature.game_session_report"},
+    };
+    if (reason && reasonCap)
+        reason[0] = '\0';
+    for (const RequiredSetting& setting : requiredSettings) {
+        wchar_t value[128] = {};
+        static constexpr wchar_t missingValue[] = L"__FPSOVERLAY_MISSING__";
+        GetPrivateProfileStringW(setting.section, setting.key, missingValue,
+                                 value, ARRAYSIZE(value), path);
+        if (wcscmp(value, missingValue) == 0 || value[0] == L'\0') {
+            if (reason && reasonCap) {
+                snprintf(reason, reasonCap, "missing_%s",
+                         setting.diagnosticName);
+            }
+            return false;
+        }
+    }
+    if (GetPrivateProfileIntW(L"App", L"schema_version", -1, path) !=
+        CONFIG_SCHEMA_VERSION) {
+        if (reason && reasonCap)
+            snprintf(reason, reasonCap, "%s", "schema_mismatch");
+        return false;
+    }
+    return true;
+}
+
 static bool BackupAndResetConfig(const char* reason)
 {
     InitConfigPath();
@@ -511,18 +619,22 @@ static bool BackupAndResetConfig(const char* reason)
     char stamp[32] = {};
     BuildTimestampSuffix(stamp, sizeof(stamp));
 
-    char backupPath[MAX_PATH] = {};
-    snprintf(backupPath, MAX_PATH, "%s.%s.%s.bak",
-             g_configPath, reason && reason[0] ? reason : "recovered", stamp);
+    const std::wstring reasonWide = Utf8ToWidePathText(
+        reason && reason[0] ? reason : "recovered");
+    const std::wstring stampWide = Utf8ToWidePathText(stamp);
+    const std::wstring backupPath = g_configPathWide + L"." + reasonWide +
+                                    L"." + stampWide + L".bak";
 
-    if (!CopyFileA(g_configPath, backupPath, FALSE)) {
-        if (!MoveFileExA(g_configPath, backupPath, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING))
+    if (!CopyFileW(g_configPathWide.c_str(), backupPath.c_str(), FALSE)) {
+        if (!MoveFileExW(g_configPathWide.c_str(), backupPath.c_str(),
+                         MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING))
             return false;
     } else {
-        DeleteFileA(g_configPath);
+        DeleteFileW(g_configPathWide.c_str());
     }
 
-    snprintf(g_lastConfigBackupPath, sizeof(g_lastConfigBackupPath), "%s", backupPath);
+    CopyWidePathAsUtf8(backupPath, g_lastConfigBackupPath,
+                       sizeof(g_lastConfigBackupPath));
     return true;
 }
 
@@ -532,15 +644,17 @@ static bool RecoverConfigIfNeeded()
     g_lastConfigBackupPath[0] = '\0';
     g_lastConfigRecoveryReason[0] = '\0';
 
-    const DWORD attrib = GetFileAttributesA(g_configPath);
+    const DWORD attrib = GetFileAttributesW(g_configPathWide.c_str());
     if (attrib == INVALID_FILE_ATTRIBUTES)
         return false;
 
     char reason[128] = {};
-    if (!ConfigFileLooksUsable(g_configPath, reason, sizeof(reason)))
+    if (!ConfigFileLooksUsable(
+            g_configPathWide.c_str(), reason, sizeof(reason)))
         return BackupAndResetConfig(reason);
 
-    const int schema = GetPrivateProfileIntA("App", "schema_version", 0, g_configPath);
+    const int schema = GetPrivateProfileIntW(
+        L"App", L"schema_version", 0, g_configPathWide.c_str());
     if (schema > CONFIG_SCHEMA_VERSION)
         return BackupAndResetConfig("future_schema");
 
@@ -549,44 +663,76 @@ static bool RecoverConfigIfNeeded()
 
 static int ReadIniInt(const char* section, const char* key, int defaultVal)
 {
-    return GetPrivateProfileIntA(section, key, defaultVal, g_configPath);
+    const std::wstring sectionWide = Utf8ToWidePathText(section);
+    const std::wstring keyWide = Utf8ToWidePathText(key);
+    return GetPrivateProfileIntW(sectionWide.c_str(), keyWide.c_str(),
+                                 defaultVal, g_configPathWide.c_str());
 }
 
 static float ReadIniFloat(const char* section, const char* key, float defaultVal)
 {
-    char buf[32];
-    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), g_configPath);
-    if (buf[0] == '\0') return defaultVal;
-    return (float)atof(buf);
+    wchar_t buffer[32] = {};
+    const std::wstring sectionWide = Utf8ToWidePathText(section);
+    const std::wstring keyWide = Utf8ToWidePathText(key);
+    GetPrivateProfileStringW(sectionWide.c_str(), keyWide.c_str(), L"",
+                             buffer, ARRAYSIZE(buffer),
+                             g_configPathWide.c_str());
+    if (buffer[0] == L'\0')
+        return defaultVal;
+    return static_cast<float>(_wtof(buffer));
 }
 
 static void WriteIniInt(const char* section, const char* key, int value)
 {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d", value);
-    WritePrivateProfileStringA(section, key, buf,
-                               g_iniWritePath ? g_iniWritePath : g_configPath);
+    wchar_t buffer[32] = {};
+    swprintf_s(buffer, L"%d", value);
+    const std::wstring sectionWide = Utf8ToWidePathText(section);
+    const std::wstring keyWide = Utf8ToWidePathText(key);
+    if (!WritePrivateProfileStringW(
+            sectionWide.c_str(), keyWide.c_str(), buffer,
+            g_iniWritePath ? g_iniWritePath : g_configPathWide.c_str())) {
+        g_iniWriteSucceeded = false;
+    }
 }
 
 static void WriteIniFloat(const char* section, const char* key, float value)
 {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f", value);
-    WritePrivateProfileStringA(section, key, buf,
-                               g_iniWritePath ? g_iniWritePath : g_configPath);
+    wchar_t buffer[32] = {};
+    swprintf_s(buffer, L"%.2f", value);
+    const std::wstring sectionWide = Utf8ToWidePathText(section);
+    const std::wstring keyWide = Utf8ToWidePathText(key);
+    if (!WritePrivateProfileStringW(
+            sectionWide.c_str(), keyWide.c_str(), buffer,
+            g_iniWritePath ? g_iniWritePath : g_configPathWide.c_str())) {
+        g_iniWriteSucceeded = false;
+    }
 }
 
 static void ReadIniStr(const char* section, const char* key, char* out, size_t cap)
 {
     if (!cap) return;
-    GetPrivateProfileStringA(section, key, "", out, (DWORD)cap, g_configPath);
-    out[cap - 1] = '\0';
+    const std::wstring sectionWide = Utf8ToWidePathText(section);
+    const std::wstring keyWide = Utf8ToWidePathText(key);
+    std::vector<wchar_t> wideValue((std::max)(cap, static_cast<size_t>(2)), L'\0');
+    GetPrivateProfileStringW(
+        sectionWide.c_str(), keyWide.c_str(), L"", wideValue.data(),
+        static_cast<DWORD>((std::min)(wideValue.size(),
+                                     static_cast<size_t>(MAXDWORD))),
+        g_configPathWide.c_str());
+    const std::string utf8 = WideToUtf8PathText(wideValue.data());
+    snprintf(out, cap, "%s", utf8.c_str());
 }
 
 static void WriteIniStr(const char* section, const char* key, const char* value)
 {
-    WritePrivateProfileStringA(section, key, value ? value : "",
-                               g_iniWritePath ? g_iniWritePath : g_configPath);
+    const std::wstring sectionWide = Utf8ToWidePathText(section);
+    const std::wstring keyWide = Utf8ToWidePathText(key);
+    const std::wstring valueWide = Utf8ToWidePathText(value ? value : "");
+    if (!WritePrivateProfileStringW(
+            sectionWide.c_str(), keyWide.c_str(), valueWide.c_str(),
+            g_iniWritePath ? g_iniWritePath : g_configPathWide.c_str())) {
+        g_iniWriteSucceeded = false;
+    }
 }
 
 // PawnIO reboot gate — sidecar state (see CommitPawnIORebootPending / CheckPawnIORebootGateOrExit).
@@ -597,7 +743,8 @@ static bool WritePawnIORebootPendingStateFile(const char* hex16)
     char line[96];
     snprintf(line, sizeof(line), "FPSOVERLAY_PAWNIO_REBOOT 1 %s\n", hex16);
     const DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH;
-    HANDLE h = CreateFileA(g_pawnioRebootStatePath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+    HANDLE h = CreateFileW(g_pawnioRebootStatePathWide.c_str(), GENERIC_WRITE,
+                           0, nullptr, CREATE_ALWAYS,
                            flags, nullptr);
     if (h == INVALID_HANDLE_VALUE)
         return false;
@@ -614,7 +761,8 @@ static bool ReadPawnIORebootPendingStateFile(char* hexOut, size_t cap)
     if (!hexOut || cap < 17) return false;
     hexOut[0] = '\0';
     InitConfigPath();
-    HANDLE h = CreateFileA(g_pawnioRebootStatePath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    HANDLE h = CreateFileW(g_pawnioRebootStatePathWide.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
         return false;
@@ -639,7 +787,7 @@ static bool ReadPawnIORebootPendingStateFile(char* hexOut, size_t cap)
 static void DeletePawnIORebootPendingStateFile()
 {
     InitConfigPath();
-    DeleteFileA(g_pawnioRebootStatePath);
+    DeleteFileW(g_pawnioRebootStatePathWide.c_str());
 }
 
 static void LoadConfig(OverlayConfig& cfg)
@@ -652,7 +800,7 @@ static void LoadConfig(OverlayConfig& cfg)
     }
     
     // Check if config file exists
-    DWORD attrib = GetFileAttributesA(g_configPath);
+    DWORD attrib = GetFileAttributesW(g_configPathWide.c_str());
     if (attrib == INVALID_FILE_ATTRIBUTES) {
         // No config file, use defaults
         return;
@@ -732,7 +880,7 @@ static void LoadConfig(OverlayConfig& cfg)
         } else {
             // Previous versions created the task without a visible switch.
             // Preserve that state during migration when the old path marker exists.
-            char legacyTaskPath[MAX_PATH] = {};
+            char legacyTaskPath[kExtendedPathCapacity] = {};
             ReadIniStr("App", "AutoLaunchTaskPath", legacyTaskPath, sizeof(legacyTaskPath));
             cfg.startWithWindows = legacyTaskPath[0] != '\0';
         }
@@ -896,13 +1044,12 @@ static bool SaveConfig(const OverlayConfig& cfg)
         snprintf(pawnioHex, sizeof(pawnioHex), "%s", sidecarHex);
     }
 
-    char finalConfigPath[MAX_PATH] = {};
-    char tempConfigPath[MAX_PATH] = {};
-    snprintf(finalConfigPath, sizeof(finalConfigPath), "%s", g_configPath);
-    snprintf(tempConfigPath, sizeof(tempConfigPath), "%s.tmp", finalConfigPath);
-    DeleteFileA(tempConfigPath);
-    CopyFileA(finalConfigPath, tempConfigPath, FALSE);
-    g_iniWritePath = tempConfigPath;
+    const std::wstring finalConfigPath = g_configPathWide;
+    const std::wstring tempConfigPath = finalConfigPath + L".tmp";
+    DeleteFileW(tempConfigPath.c_str());
+    CopyFileW(finalConfigPath.c_str(), tempConfigPath.c_str(), FALSE);
+    g_iniWritePath = tempConfigPath.c_str();
+    g_iniWriteSucceeded = true;
 
     WriteIniInt("App", "schema_version", CONFIG_SCHEMA_VERSION);
     WriteIniStr("App", "app_version", APP_VERSION);
@@ -1027,22 +1174,28 @@ static bool SaveConfig(const OverlayConfig& cfg)
     // Flush the profile cache before replacing the live file. Some Windows
     // versions return FALSE here even though the temporary file was written,
     // so the replace operation is the authoritative success check.
-    WritePrivateProfileStringA(nullptr, nullptr, nullptr, tempConfigPath);
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, tempConfigPath.c_str());
+    const bool writesSucceeded = g_iniWriteSucceeded;
     g_iniWritePath = nullptr;
     char validationReason[128] = {};
-    if (!ConfigFileLooksUsable(tempConfigPath, validationReason,
-                               sizeof(validationReason))) {
-        DeleteFileA(tempConfigPath);
+    if (!writesSucceeded ||
+        !ConfigFileLooksUsable(tempConfigPath.c_str(), validationReason,
+                               sizeof(validationReason)) ||
+        !ConfigFileHasRequiredSettings(tempConfigPath.c_str(), validationReason,
+                                       sizeof(validationReason))) {
+        DeleteFileW(tempConfigPath.c_str());
         LogLine("Temporary config validation failed: reason=%s",
-                validationReason[0] ? validationReason : "unknown");
+                writesSucceeded
+                    ? (validationReason[0] ? validationReason : "unknown")
+                    : "profile_write_failed");
         g_ConfigDirty = true;
         g_ConfigDirtyTick = GetTickCount64();
         return false;
     }
-    if (!MoveFileExA(tempConfigPath, finalConfigPath,
+    if (!MoveFileExW(tempConfigPath.c_str(), finalConfigPath.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         const DWORD error = GetLastError();
-        DeleteFileA(tempConfigPath);
+        DeleteFileW(tempConfigPath.c_str());
         LogLine("Atomic config save failed: err=%lu", (unsigned long)error);
         g_ConfigDirty = true;
         g_ConfigDirtyTick = GetTickCount64();
@@ -1975,8 +2128,8 @@ static bool IsAutoLaunchTaskEnabled()
 
 static bool IsAutoLaunchTaskCurrentExecutable()
 {
-    wchar_t currentExePath[MAX_PATH] = {};
-    if (!GetModuleFileNameW(nullptr, currentExePath, ARRAYSIZE(currentExePath)))
+    InitConfigPath();
+    if (g_executablePathWide.empty())
         return false;
 
     ITaskService* service = nullptr;
@@ -1990,7 +2143,7 @@ static bool IsAutoLaunchTaskCurrentExecutable()
     BSTR xml = nullptr;
     const bool current = SUCCEEDED(hr) && task &&
         SUCCEEDED(task->get_Xml(&xml)) && xml &&
-        wcsstr(xml, currentExePath) != nullptr;
+        wcsstr(xml, g_executablePathWide.c_str()) != nullptr;
 
     if (xml) SysFreeString(xml);
     ReleaseCom(task);
@@ -2028,12 +2181,12 @@ static bool SetAutoLaunchTaskEnabled(bool enabled)
         return success;
     }
 
-    wchar_t exePath[MAX_PATH] = {};
-    char exePathA[MAX_PATH] = {};
+    InitConfigPath();
+    const std::wstring& exePath = g_executablePathWide;
+    const std::string exePathUtf8 = WideToUtf8PathText(exePath);
     wchar_t userName[256] = {};
     DWORD userNameChars = ARRAYSIZE(userName);
-    if (!GetModuleFileNameW(nullptr, exePath, ARRAYSIZE(exePath)) ||
-        !GetModuleFileNameA(nullptr, exePathA, ARRAYSIZE(exePathA)) ||
+    if (exePath.empty() || exePathUtf8.empty() ||
         !GetUserNameW(userName, &userNameChars)) {
         ReleaseCom(root);
         ReleaseCom(service);
@@ -2041,10 +2194,8 @@ static bool SetAutoLaunchTaskEnabled(bool enabled)
         return false;
     }
 
-    wchar_t workingDirectory[MAX_PATH] = {};
-    wcsncpy_s(workingDirectory, exePath, _TRUNCATE);
-    if (wchar_t* slash = wcsrchr(workingDirectory, L'\\'))
-        *slash = L'\0';
+    const std::wstring workingDirectory =
+        std::filesystem::path(exePath).parent_path().wstring();
 
     ITaskDefinition* definition = nullptr;
     IRegistrationInfo* registration = nullptr;
@@ -2106,9 +2257,9 @@ static bool SetAutoLaunchTaskEnabled(bool enabled)
         hr = action->QueryInterface(IID_IExecAction,
                                     reinterpret_cast<void**>(&execAction));
     if (SUCCEEDED(hr))
-        hr = execAction->put_Path(_bstr_t(exePath));
+        hr = execAction->put_Path(_bstr_t(exePath.c_str()));
     if (SUCCEEDED(hr))
-        hr = execAction->put_WorkingDirectory(_bstr_t(workingDirectory));
+        hr = execAction->put_WorkingDirectory(_bstr_t(workingDirectory.c_str()));
 
     if (SUCCEEDED(hr)) {
         hr = root->RegisterTaskDefinition(
@@ -2123,8 +2274,8 @@ static bool SetAutoLaunchTaskEnabled(bool enabled)
     }
     success = SUCCEEDED(hr) && registered != nullptr;
     if (success) {
-        WriteIniStr("App", "AutoLaunchTaskPath", exePathA);
-        LogLine("Windows auto-start enabled: %s", exePathA);
+        WriteIniStr("App", "AutoLaunchTaskPath", exePathUtf8.c_str());
+        LogLine("Windows auto-start enabled: %s", exePathUtf8.c_str());
     }
 
     ReleaseCom(registered);
@@ -2148,12 +2299,12 @@ static void ReconcileAutoLaunchTask()
 {
     bool success = true;
     if (g_Config.startWithWindows) {
-        char previous[MAX_PATH] = {};
-        char current[MAX_PATH] = {};
+        char previous[kExtendedPathCapacity] = {};
+        InitConfigPath();
+        const std::string current = WideToUtf8PathText(g_executablePathWide);
         ReadIniStr("App", "AutoLaunchTaskPath", previous, sizeof(previous));
-        GetModuleFileNameA(nullptr, current, sizeof(current));
         if (!IsAutoLaunchTaskEnabled() || !IsAutoLaunchTaskCurrentExecutable() ||
-            strcmp(previous, current) != 0)
+            strcmp(previous, current.c_str()) != 0)
             success = SetAutoLaunchTaskEnabled(true);
     } else if (QueryAutoLaunchTask(nullptr)) {
         success = SetAutoLaunchTaskEnabled(false);
@@ -2309,16 +2460,18 @@ static void GetProcessName(DWORD pid, char* outName, size_t maxLen)
         hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProc) return;
 
-    wchar_t fullPathW[MAX_PATH] = {};
-    DWORD dw = MAX_PATH;
-    if (QueryFullProcessImageNameW(hProc, 0, fullPathW, &dw)) {
-        const wchar_t* slash = wcsrchr(fullPathW, L'\\');
-        const wchar_t* exeW = slash ? (slash + 1) : fullPathW;
+    std::vector<wchar_t> fullPathW(kExtendedPathCapacity, L'\0');
+    DWORD pathCharacters = static_cast<DWORD>(fullPathW.size());
+    if (QueryFullProcessImageNameW(
+            hProc, 0, fullPathW.data(), &pathCharacters)) {
+        const wchar_t* slash = wcsrchr(fullPathW.data(), L'\\');
+        const wchar_t* exeW = slash ? (slash + 1) : fullPathW.data();
 
         char exeUtf8[320] = {};
         char descUtf8[512] = {};
         WideToUtf8(exeW, exeUtf8, sizeof(exeUtf8));
-        GetFileDescriptionUtf8FromPathW(fullPathW, descUtf8, sizeof(descUtf8));
+        GetFileDescriptionUtf8FromPathW(
+            fullPathW.data(), descUtf8, sizeof(descUtf8));
 
         if (descUtf8[0])
             snprintf(outName, maxLen, "%s (%s)", exeUtf8, descUtf8);
@@ -2340,12 +2493,13 @@ static bool GetProcessExeName(DWORD pid, char* outName, size_t maxLen)
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProc) return false;
 
-    wchar_t fullPathW[MAX_PATH] = {};
-    DWORD dw = MAX_PATH;
+    std::vector<wchar_t> fullPathW(kExtendedPathCapacity, L'\0');
+    DWORD pathCharacters = static_cast<DWORD>(fullPathW.size());
     bool ok = false;
-    if (QueryFullProcessImageNameW(hProc, 0, fullPathW, &dw)) {
-        const wchar_t* slash = wcsrchr(fullPathW, L'\\');
-        const wchar_t* exeW = slash ? (slash + 1) : fullPathW;
+    if (QueryFullProcessImageNameW(
+            hProc, 0, fullPathW.data(), &pathCharacters)) {
+        const wchar_t* slash = wcsrchr(fullPathW.data(), L'\\');
+        const wchar_t* exeW = slash ? (slash + 1) : fullPathW.data();
         WideToUtf8(exeW, outName, maxLen);
         ok = outName[0] != '\0';
     }
@@ -2362,11 +2516,12 @@ static bool GetProcessImagePath(DWORD pid, char* outPath, size_t maxLen)
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProc) return false;
 
-    wchar_t fullPathW[1024] = {};
-    DWORD length = ARRAYSIZE(fullPathW);
+    std::vector<wchar_t> fullPathW(kExtendedPathCapacity, L'\0');
+    DWORD length = static_cast<DWORD>(fullPathW.size());
     bool ok = false;
-    if (QueryFullProcessImageNameW(hProc, 0, fullPathW, &length)) {
-        WideToUtf8(fullPathW, outPath, maxLen);
+    if (QueryFullProcessImageNameW(
+            hProc, 0, fullPathW.data(), &length)) {
+        WideToUtf8(fullPathW.data(), outPath, maxLen);
         ok = outPath[0] != '\0';
     }
     CloseHandle(hProc);
@@ -2410,6 +2565,12 @@ static bool IsIgnoredForegroundProcess(const char* exeName)
 static bool IsKnownDesktopProcess(const char* exeName)
 {
     if (!exeName || !exeName[0]) return false;
+    const std::string loweredExe = LowerAscii(exeName);
+    if (loweredExe.rfind("overlay_uiqa_v", 0) == 0 ||
+        loweredExe.rfind("overlay_v", 0) == 0 ||
+        ExecutableNameEquals(exeName, "overlay.exe")) {
+        return true;
+    }
     static const char* desktopApps[] = {
         "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
         "opera.exe", "vivaldi.exe", "iexplore.exe",
@@ -2428,6 +2589,7 @@ static bool IsKnownDesktopProcess(const char* exeName)
         "easyanticheat.exe", "easyanticheat_eos.exe",
         "beservice.exe", "beservice_x64.exe", "start_protected_game.exe",
         "bilibili.exe", "potplayermini64.exe", "potplayermini.exe", "vlc.exe",
+        "snippingtool.exe", "pickerhost.exe", "screenclippinghost.exe",
         "wallpaper64.exe", "wallpaper32.exe", "wallpaperservice32.exe"
     };
     for (const char* name : desktopApps) {
@@ -2698,6 +2860,34 @@ static bool IsWindowMaximizedOrFullscreen(HWND foreground)
            coversRect(info.rcMonitor);
 }
 
+static bool IsBorderlessFullscreenWindow(HWND foreground)
+{
+    if (!foreground || !IsWindowVisible(foreground) || IsIconic(foreground) ||
+        IsZoomed(foreground)) {
+        return false;
+    }
+
+    RECT windowRect = {};
+    if (FAILED(DwmGetWindowAttribute(
+            foreground, DWMWA_EXTENDED_FRAME_BOUNDS,
+            &windowRect, sizeof(windowRect))) &&
+        !GetWindowRect(foreground, &windowRect)) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONULL);
+    MONITORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfo(monitor, &info))
+        return false;
+
+    constexpr int tolerancePx = 4;
+    return windowRect.left <= info.rcMonitor.left + tolerancePx &&
+           windowRect.top <= info.rcMonitor.top + tolerancePx &&
+           windowRect.right >= info.rcMonitor.right - tolerancePx &&
+           windowRect.bottom >= info.rcMonitor.bottom - tolerancePx;
+}
+
 struct ForegroundSnapshot {
     HWND window = nullptr;
     DWORD pid = 0;
@@ -2708,6 +2898,7 @@ struct ForegroundSnapshot {
     bool knownDesktop = false;
     bool strongGame = false;
     bool fullscreen = false;
+    bool borderlessFullscreen = false;
 };
 
 static ForegroundSnapshot CaptureForegroundSnapshot()
@@ -2733,6 +2924,7 @@ static ForegroundSnapshot CaptureForegroundSnapshot()
     snapshot.strongGame = snapshot.hasIdentity &&
         HasStrongGameIdentity(snapshot.exeName, snapshot.imagePath);
     snapshot.fullscreen = IsWindowMaximizedOrFullscreen(snapshot.window);
+    snapshot.borderlessFullscreen = IsBorderlessFullscreenWindow(snapshot.window);
     return snapshot;
 }
 
@@ -2769,7 +2961,9 @@ static void UpdateDesktopVisibilityDecision(
             ? g_autoGameFps.load(std::memory_order_relaxed)
             : 0.0f;
     const bool hasRenderEvidence =
-        !knownDesktop && (directFps >= 12.0f || automaticFps >= 12.0f);
+        !knownDesktop && foreground.likelyGameWindow &&
+        (strongGame || foreground.borderlessFullscreen) &&
+        (directFps >= 12.0f || automaticFps >= 12.0f);
     if (hasRenderEvidence) {
         if (s_renderEvidenceSince == 0)
             s_renderEvidenceSince = now;
@@ -2777,7 +2971,7 @@ static void UpdateDesktopVisibilityDecision(
         s_renderEvidenceSince = 0;
     }
     const bool sustainedRender =
-        s_renderEvidenceSince != 0 && now - s_renderEvidenceSince >= 600;
+        s_renderEvidenceSince != 0 && now - s_renderEvidenceSince >= 2000;
     g_ForegroundGameConfirmed = strongGame || sustainedRender || activeGameTarget;
     if (strongGame || sustainedRender) {
         RememberRecentGame(foreground.pid, g_DesktopForegroundExe);
@@ -3154,16 +3348,11 @@ static bool QueryAsusSystemFanRpm(float* rpmOut)
 
 static void WriteAsusWmiDiagnostics()
 {
-    char exePath[MAX_PATH] = {};
-    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH))
-        return;
-    char* slash = strrchr(exePath, '\\');
-    if (!slash)
-        return;
-    *(slash + 1) = '\0';
-    strcat_s(exePath, MAX_PATH, "asus-wmi-diagnostics.txt");
-
-    std::ofstream out(exePath, std::ios::out | std::ios::trunc);
+    InitConfigPath();
+    const std::filesystem::path diagnosticPath =
+        std::filesystem::path(g_configPathWide).parent_path() /
+        L"asus-wmi-diagnostics.txt";
+    std::ofstream out(diagnosticPath, std::ios::out | std::ios::trunc);
     if (!out.is_open())
         return;
 
@@ -3308,7 +3497,15 @@ static void StartWmiCpuWorker()
         g_wmiCpuPollRequested = true;
         g_wmiCpuResultReady = false;
     }
-    g_wmiCpuWorkerThread = std::thread(WmiCpuWorkerMain);
+    try {
+        g_wmiCpuWorkerThread = std::thread(WmiCpuWorkerMain);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(g_wmiCpuWorkerMutex);
+        g_wmiCpuWorkerStop = true;
+        g_wmiCpuPollRequested = false;
+        LogLine("WMI CPU worker thread creation failed");
+        return;
+    }
     g_wmiCpuWorkerCv.notify_one();
 }
 
@@ -3430,46 +3627,115 @@ static bool GetFileVersionQuad(const char* path, DWORD* verMS, DWORD* verLS)
     return (*verMS | *verLS) != 0;
 }
 
-// Write embedded PawnIO_setup.exe bytes to an absolute path (overwrites).
-static bool WriteEmbeddedPawnIOSetupToPath(const char* destPath)
+static bool GetFileVersionQuadW(
+    const wchar_t* path, DWORD* verMS, DWORD* verLS)
 {
-    HMODULE hModule = GetModuleHandle(nullptr);
-    HRSRC hResource = FindResource(hModule, MAKEINTRESOURCE(IDR_PAWNIO_SETUP), RT_RCDATA);
-    if (!hResource)
+    if (!path || !path[0] || !verMS || !verLS)
         return false;
-    HGLOBAL hLoadedResource = LoadResource(hModule, hResource);
-    if (!hLoadedResource)
+    DWORD dummy = 0;
+    const DWORD versionSize = GetFileVersionInfoSizeW(path, &dummy);
+    if (!versionSize)
         return false;
-    LPVOID pResourceData = LockResource(hLoadedResource);
-    DWORD dwResourceSize = SizeofResource(hModule, hResource);
-    if (!pResourceData || dwResourceSize == 0)
+    std::vector<BYTE> data(versionSize);
+    if (!GetFileVersionInfoW(path, 0, versionSize, data.data()))
         return false;
-    HANDLE hFile = CreateFileA(destPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE)
+    VS_FIXEDFILEINFO* fileInfo = nullptr;
+    UINT fileInfoLength = 0;
+    if (!VerQueryValueW(data.data(), L"\\",
+                        reinterpret_cast<void**>(&fileInfo),
+                        &fileInfoLength) ||
+        !fileInfo || fileInfoLength < sizeof(VS_FIXEDFILEINFO)) {
         return false;
-    DWORD bytesWritten = 0;
-    BOOL writeResult = WriteFile(hFile, pResourceData, dwResourceSize, &bytesWritten, nullptr);
-    CloseHandle(hFile);
-    if (!writeResult || bytesWritten != dwResourceSize) {
-        DeleteFileA(destPath);
+    }
+    *verMS = fileInfo->dwFileVersionMS;
+    *verLS = fileInfo->dwFileVersionLS;
+    return (*verMS | *verLS) != 0;
+}
+
+static bool WriteEmbeddedPawnIOSetupToPathW(const wchar_t* destPath)
+{
+    if (!destPath || !destPath[0])
+        return false;
+    HMODULE module = GetModuleHandleW(nullptr);
+    HRSRC resource = FindResourceW(
+        module, MAKEINTRESOURCEW(IDR_PAWNIO_SETUP), MAKEINTRESOURCEW(10));
+    if (!resource)
+        return false;
+    HGLOBAL loaded = LoadResource(module, resource);
+    const void* data = loaded ? LockResource(loaded) : nullptr;
+    const DWORD size = SizeofResource(module, resource);
+    if (!data || size == 0)
+        return false;
+
+    HANDLE file = CreateFileW(
+        destPath, GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    DWORD written = 0;
+    const BOOL writeOk = WriteFile(file, data, size, &written, nullptr);
+    const BOOL flushOk = writeOk ? FlushFileBuffers(file) : FALSE;
+    CloseHandle(file);
+    if (!writeOk || !flushOk || written != size) {
+        DeleteFileW(destPath);
         return false;
     }
     return true;
 }
 
+static bool CreateSecurePawnIoInstallerDirectory(
+    std::filesystem::path& directory)
+{
+    wchar_t programData[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(
+            nullptr, CSIDL_COMMON_APPDATA, nullptr,
+            SHGFP_TYPE_CURRENT, programData))) {
+        return false;
+    }
+
+    GUID guid = {};
+    wchar_t guidText[64] = {};
+    if (FAILED(CoCreateGuid(&guid)) ||
+        StringFromGUID2(guid, guidText, ARRAYSIZE(guidText)) <= 0) {
+        return false;
+    }
+    for (wchar_t* character = guidText; *character; ++character) {
+        if (*character == L'{' || *character == L'}')
+            *character = L'_';
+    }
+    directory = std::filesystem::path(programData) /
+        (std::wstring(L"FPSOverlay-Installer-") + guidText);
+
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    constexpr const wchar_t* kInstallerDirectorySddl =
+        L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            kInstallerDirectorySddl, SDDL_REVISION_1,
+            &descriptor, nullptr)) {
+        return false;
+    }
+    SECURITY_ATTRIBUTES attributes = {};
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = descriptor;
+    const BOOL created = CreateDirectoryW(directory.c_str(), &attributes);
+    LocalFree(descriptor);
+    return created != FALSE;
+}
+
 static bool GetBundledPawnIOSetupVersion(DWORD* verMS, DWORD* verLS)
 {
-    char tempPath[MAX_PATH];
-    char tempFile[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, tempPath) == 0)
+    std::filesystem::path installerDirectory;
+    if (!CreateSecurePawnIoInstallerDirectory(installerDirectory))
         return false;
-    snprintf(tempFile, MAX_PATH, "%sFPSOverlay_PawnIO_setup_%llu.exe", tempPath,
-             (unsigned long long)GetTickCount64());
-    if (!WriteEmbeddedPawnIOSetupToPath(tempFile))
+    const std::filesystem::path installerPath =
+        installerDirectory / L"PawnIO_setup.exe";
+    if (!WriteEmbeddedPawnIOSetupToPathW(installerPath.c_str())) {
+        RemoveDirectoryW(installerDirectory.c_str());
         return false;
-    bool ok = GetFileVersionQuad(tempFile, verMS, verLS);
-    DeleteFileA(tempFile);
+    }
+    const bool ok = GetFileVersionQuadW(installerPath.c_str(), verMS, verLS);
+    DeleteFileW(installerPath.c_str());
+    RemoveDirectoryW(installerDirectory.c_str());
     return ok;
 }
 
@@ -3935,29 +4201,47 @@ static void RequireSystemRestartAfterPawnIOSetup()
 // Extract embedded PawnIO_setup.exe and run it (-install). Success only if the process exits with code 0.
 static bool ExtractAndRunPawnIOSetup()
 {
-    char tempPath[MAX_PATH];
-    char tempFile[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, tempPath) == 0)
+    std::filesystem::path installerDirectory;
+    if (!CreateSecurePawnIoInstallerDirectory(installerDirectory))
         return false;
-    snprintf(tempFile, MAX_PATH, "%sFPSOverlay_PawnIO_setup_run_%llu.exe", tempPath,
-             (unsigned long long)GetTickCount64());
-    if (!WriteEmbeddedPawnIOSetupToPath(tempFile))
+    const std::filesystem::path installerPath =
+        installerDirectory / L"PawnIO_setup.exe";
+    if (!WriteEmbeddedPawnIOSetupToPathW(installerPath.c_str())) {
+        RemoveDirectoryW(installerDirectory.c_str());
         return false;
 
-    SHELLEXECUTEINFOA sei = { sizeof(sei) };
-    sei.lpVerb = "runas";
-    sei.lpFile = tempFile;
-    sei.lpParameters = "-install";
+    }
+
+    // Keep a read handle without write/delete sharing until the child exits.
+    // This prevents replacing the validated embedded installer between write
+    // completion and process creation.
+    HANDLE installerGuard = CreateFileW(
+        installerPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (installerGuard == INVALID_HANDLE_VALUE) {
+        DeleteFileW(installerPath.c_str());
+        RemoveDirectoryW(installerDirectory.c_str());
+        return false;
+    }
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.lpVerb = L"runas";
+    sei.lpFile = installerPath.c_str();
+    sei.lpParameters = L"-install";
     sei.nShow = SW_HIDE;
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
 
-    if (!ShellExecuteExA(&sei)) {
-        DeleteFileA(tempFile);
+    if (!ShellExecuteExW(&sei)) {
+        CloseHandle(installerGuard);
+        DeleteFileW(installerPath.c_str());
+        RemoveDirectoryW(installerDirectory.c_str());
         return false;
     }
 
     if (!sei.hProcess) {
-        DeleteFileA(tempFile);
+        CloseHandle(installerGuard);
+        DeleteFileW(installerPath.c_str());
+        RemoveDirectoryW(installerDirectory.c_str());
         return false;
     }
 
@@ -3965,11 +4249,15 @@ static bool ExtractAndRunPawnIOSetup()
     DWORD exitCode = (DWORD)-1;
     if (!GetExitCodeProcess(sei.hProcess, &exitCode)) {
         CloseHandle(sei.hProcess);
-        DeleteFileA(tempFile);
+        CloseHandle(installerGuard);
+        DeleteFileW(installerPath.c_str());
+        RemoveDirectoryW(installerDirectory.c_str());
         return false;
     }
     CloseHandle(sei.hProcess);
-    DeleteFileA(tempFile);
+    CloseHandle(installerGuard);
+    DeleteFileW(installerPath.c_str());
+    RemoveDirectoryW(installerDirectory.c_str());
 
     if (exitCode == STILL_ACTIVE)
         return false;
@@ -5340,12 +5628,17 @@ static void StartLhwmInitializationThread()
         g_lhwmInitThread.join();
     g_lhwmAvailable.store(false, std::memory_order_release);
     g_lhwmInitFinished.store(false, std::memory_order_release);
-    g_lhwmInitThread = std::thread([]() {
-        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        LhwmBackgroundInitThread();
-        if (SUCCEEDED(comResult))
-            CoUninitialize();
-    });
+    try {
+        g_lhwmInitThread = std::thread([]() {
+            const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            LhwmBackgroundInitThread();
+            if (SUCCEEDED(comResult))
+                CoUninitialize();
+        });
+    } catch (...) {
+        g_lhwmInitFinished.store(true, std::memory_order_release);
+        LogLine("LibreHardwareMonitor init thread creation failed");
+    }
 }
 
 [[maybe_unused]] static void PollLHWMStats()
@@ -5533,7 +5826,8 @@ static void ScheduleAsyncLHWMStatsPoll()
 
     if (g_asyncLhwmPollThread.joinable())
         g_asyncLhwmPollThread.join();
-    g_asyncLhwmPollThread = std::thread([
+    try {
+        g_asyncLhwmPollThread = std::thread([
         cpuTempPath,
         gpuTempPath,
         gpuLoadPath,
@@ -5664,7 +5958,11 @@ static void ScheduleAsyncLHWMStatsPoll()
         if (SUCCEEDED(comResult))
             CoUninitialize();
         g_asyncLhwmPollInFlight.store(false, std::memory_order_release);
-    });
+        });
+    } catch (...) {
+        g_asyncLhwmPollInFlight.store(false, std::memory_order_release);
+        LogLine("LibreHardwareMonitor poll thread creation failed");
+    }
 }
 
 static void ApplyAsyncLHWMStatsSnapshot()
@@ -5765,7 +6063,8 @@ static void ScheduleComparisonPowerPoll()
 
     if (g_comparisonPowerPollThread.joinable())
         g_comparisonPowerPollThread.join();
-    g_comparisonPowerPollThread = std::thread([
+    try {
+        g_comparisonPowerPollThread = std::thread([
         cpuPowerPath,
         cpuMemoryPowerPath,
         cpuPlatformPowerPath,
@@ -5816,7 +6115,11 @@ static void ScheduleComparisonPowerPoll()
         if (SUCCEEDED(comResult))
             CoUninitialize();
         g_comparisonPowerPollInFlight.store(false, std::memory_order_release);
-    });
+        });
+    } catch (...) {
+        g_comparisonPowerPollInFlight.store(false, std::memory_order_release);
+        LogLine("Comparison power poll thread creation failed");
+    }
 }
 
 static void ApplyComparisonPowerPollSnapshot()
@@ -6004,41 +6307,38 @@ static void ProcessLhwmRescanRequest()
     StartLhwmInitializationThread();
 }
 
-static void GetExeDirectoryA(char* out, size_t cap)
+static void CopyFileIfExists(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination)
 {
-    if (!out || cap == 0) return;
-    InitConfigPath();
-    snprintf(out, cap, "%s", g_configPath);
-    char* slash = strrchr(out, '\\');
-    if (slash) *(slash + 1) = '\0';
+    std::error_code fileError;
+    if (std::filesystem::is_regular_file(source, fileError) && !fileError) {
+        fileError.clear();
+        std::filesystem::copy_file(
+            source, destination,
+            std::filesystem::copy_options::overwrite_existing, fileError);
+    }
 }
 
-static void CopyFileIfExistsA(const char* src, const char* dst)
-{
-    if (!src || !dst || !src[0] || !dst[0]) return;
-    if (GetFileAttributesA(src) != INVALID_FILE_ATTRIBUTES)
-        CopyFileA(src, dst, FALSE);
-}
-
-static bool ExportDiagnosticsPackage(char* outDir, size_t cap)
+static bool ExportDiagnosticsPackage(std::wstring& outDirectory)
 {
     InitConfigPath();
-
-    char exeDir[MAX_PATH] = {};
-    GetExeDirectoryA(exeDir, sizeof(exeDir));
+    outDirectory.clear();
+    const std::filesystem::path executableDirectory =
+        std::filesystem::path(g_configPathWide).parent_path();
 
     char stamp[32] = {};
     BuildTimestampSuffix(stamp, sizeof(stamp));
+    const std::filesystem::path diagnosticDirectory =
+        executableDirectory /
+        Utf8ToWidePathText((std::string("FPSOverlay_Diagnostics_") + stamp).c_str());
+    std::error_code directoryError;
+    std::filesystem::create_directories(diagnosticDirectory, directoryError);
+    if (directoryError)
+        return false;
 
-    char diagDir[MAX_PATH] = {};
-    snprintf(diagDir, sizeof(diagDir), "%sFPSOverlay_Diagnostics_%s", exeDir, stamp);
-    if (!CreateDirectoryA(diagDir, nullptr)) {
-        if (GetLastError() != ERROR_ALREADY_EXISTS)
-            return false;
-    }
-
-    char summaryPath[MAX_PATH] = {};
-    snprintf(summaryPath, sizeof(summaryPath), "%s\\summary.txt", diagDir);
+    const std::filesystem::path summaryPath =
+        diagnosticDirectory / L"summary.txt";
     std::ofstream out(summaryPath, std::ios::out | std::ios::trunc);
     if (!out)
         return false;
@@ -6173,20 +6473,14 @@ static bool ExportDiagnosticsPackage(char* outDir, size_t cap)
     out << "Rewrite note: diagnostics follow the lightweight snapshot idea; no ASUS control logic was imported.\n";
     out.close();
 
-    char dst[MAX_PATH] = {};
-    snprintf(dst, sizeof(dst), "%s\\config.ini", diagDir);
-    CopyFileIfExistsA(g_configPath, dst);
-    snprintf(dst, sizeof(dst), "%s\\fps-overlay.log", diagDir);
-    CopyFileIfExistsA(g_logPath, dst);
+    CopyFileIfExists(g_configPathWide, diagnosticDirectory / L"config.ini");
+    CopyFileIfExists(g_logPathWide, diagnosticDirectory / L"fps-overlay.log");
+    CopyFileIfExists(executableDirectory / L"asus-wmi-diagnostics.txt",
+                     diagnosticDirectory / L"asus-wmi-diagnostics.txt");
 
-    char asusPath[MAX_PATH] = {};
-    snprintf(asusPath, sizeof(asusPath), "%sasus-wmi-diagnostics.txt", exeDir);
-    snprintf(dst, sizeof(dst), "%s\\asus-wmi-diagnostics.txt", diagDir);
-    CopyFileIfExistsA(asusPath, dst);
-
-    if (outDir && cap)
-        snprintf(outDir, cap, "%s", diagDir);
-    LogLine("Diagnostics exported: %s", diagDir);
+    outDirectory = diagnosticDirectory.wstring();
+    LogLine("Diagnostics exported: %s",
+            WideToUtf8PathText(outDirectory).c_str());
     return true;
 }
 
@@ -6720,10 +7014,24 @@ static bool StartEtwSession()
     }
 
     g_etwRunning.store(true);
-    g_etwThread = std::thread([]() {
-        TRACEHANDLE h = g_etwTrace;
-        ProcessTrace(&h, 1, nullptr, nullptr);
-    });
+    try {
+        g_etwThread = std::thread([]() {
+            TRACEHANDLE h = g_etwTrace;
+            ProcessTrace(&h, 1, nullptr, nullptr);
+        });
+    } catch (...) {
+        g_etwRunning.store(false);
+        CloseTrace(g_etwTrace);
+        g_etwTrace = 0;
+        ZeroMemory(&buf, sizeof(buf));
+        buf.p.Wnode.BufferSize = sizeof(buf);
+        buf.p.LoggerNameOffset = offsetof(decltype(buf), name);
+        ControlTraceA(g_etwSession, ETW_SESSION_NAME, &buf.p,
+                      EVENT_TRACE_CONTROL_STOP);
+        g_etwSession = 0;
+        LogLine("ETW consumer thread creation failed");
+        return false;
+    }
 
     return true;
 }
@@ -6840,7 +7148,16 @@ void AddTrayIcon()
     }
     g_trayReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_trayOverlayVisible.store(g_OvlVisible, std::memory_order_relaxed);
-    g_trayThread = std::thread(TrayThreadMain);
+    try {
+        g_trayThread = std::thread(TrayThreadMain);
+    } catch (...) {
+        LogLine("Tray thread creation failed");
+        if (g_trayReadyEvent) {
+            CloseHandle(g_trayReadyEvent);
+            g_trayReadyEvent = nullptr;
+        }
+        return;
+    }
     if (g_trayReadyEvent)
         WaitForSingleObject(g_trayReadyEvent, 2000);
 }
@@ -8609,9 +8926,10 @@ static void DrawSettingsHardware(bool& changed)
                         MB_OK | MB_ICONERROR | MB_TOPMOST);
         }
         if (ImGui::Button("导出诊断包", ImVec2(-1.0f, 0.0f))) {
-            char diagDir[MAX_PATH] = {};
-            if (ExportDiagnosticsPackage(diagDir, sizeof(diagDir)))
-                ShellExecuteA(nullptr, "open", diagDir, nullptr, nullptr, SW_SHOWNORMAL);
+            std::wstring diagnosticDirectory;
+            if (ExportDiagnosticsPackage(diagnosticDirectory))
+                ShellExecuteW(nullptr, L"open", diagnosticDirectory.c_str(),
+                              nullptr, nullptr, SW_SHOWNORMAL);
             else
                 MessageBoxA(g_hwnd, "导出诊断包失败。", "FPS Overlay",
                             MB_OK | MB_ICONERROR | MB_TOPMOST);
@@ -9050,10 +9368,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                 autoTrayTraceDone = true;
                 HWND tray = g_trayHwnd.load(std::memory_order_acquire);
                 PostMessageW(tray, WM_TRAYICON, 1, MAKELPARAM(WM_RBUTTONUP, 1));
-                std::thread([tray]() {
-                    Sleep(300);
+                try {
+                    std::thread([tray]() {
+                        Sleep(300);
+                        PostMessageW(tray, WM_CANCELMODE, 0, 0);
+                    }).detach();
+                } catch (...) {
                     PostMessageW(tray, WM_CANCELMODE, 0, 0);
-                }).detach();
+                }
             }
         }
         if (g_Pending == CMD_SHOW_SETTINGS) {
@@ -9493,9 +9815,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             }
             ImGui::SameLine();
             if (ImGui::Button("导出诊断包##cfg_diag")) {
-                char diagDir[MAX_PATH] = {};
-                if (ExportDiagnosticsPackage(diagDir, sizeof(diagDir))) {
-                    ShellExecuteA(nullptr, "open", diagDir, nullptr, nullptr, SW_SHOWNORMAL);
+                std::wstring diagnosticDirectory;
+                if (ExportDiagnosticsPackage(diagnosticDirectory)) {
+                    ShellExecuteW(nullptr, L"open", diagnosticDirectory.c_str(),
+                                  nullptr, nullptr, SW_SHOWNORMAL);
                 } else {
                     MessageBoxA(g_hwnd, "导出诊断包失败。", "FPS Overlay",
                                 MB_OK | MB_ICONERROR | MB_TOPMOST);
@@ -9602,6 +9925,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                 }
                 const bool sustainedUnknownForeground =
                     !foregroundBlocksGameTarget && !foregroundKnownDesktop &&
+                    foreground.likelyGameWindow &&
+                    foreground.borderlessFullscreen &&
                     fgPid != 0 && autoPid == fgPid && autoFps >= 20.0f;
                 if (proposedPid == 0 && (autoStrongGame || sustainedUnknownForeground)) {
                     proposedPid = autoPid;
@@ -9879,7 +10204,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             if (gameFps <= 0.0f) {
                 const float autoFps = g_autoGameFps.load(std::memory_order_relaxed);
                 const DWORD autoPid = g_autoTargetPid.load(std::memory_order_relaxed);
-                if (autoFps > 0.0f && autoPid != 0) {
+                const DWORD selectedPid =
+                    g_targetPid.load(std::memory_order_relaxed);
+                if (autoFps > 0.0f && autoPid != 0 && autoPid == selectedPid) {
                     gameFps = autoFps;
                     static DWORD s_lastAutoNamePid = 0;
                     if (autoPid != s_lastAutoNamePid && g_targetProcessName[0] == '\0') {
