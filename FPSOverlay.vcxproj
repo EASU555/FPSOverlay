@@ -105,6 +105,7 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="features\FeatureRegistry.cpp" />
+    <ClCompile Include="features\GameSessionReportFeature.cpp" />
     <ClCompile Include="features\LaptopPowerFeature.cpp" />
     <ClCompile Include="libs\imgui\imgui.cpp" />
     <ClCompile Include="libs\imgui\imgui_draw.cpp" />
@@ -122,6 +123,7 @@
     <ClInclude Include="features\Feature.h" />
     <ClInclude Include="features\FeatureContext.h" />
     <ClInclude Include="features\FeatureRegistry.h" />
+    <ClInclude Include="features\GameSessionReportFeature.h" />
     <ClInclude Include="features\LaptopPowerFeature.h" />
     <ClInclude Include="features\SettingsUi.h" />
     <ClInclude Include="src\version.h" />

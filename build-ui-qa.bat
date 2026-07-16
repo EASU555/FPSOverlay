@@ -35,6 +35,7 @@ cl /nologo /c /std:c++20 /utf-8 /O2 /GL /Gy /Oi /sdl /EHsc /MD /W4 /permissive- 
     /Fo"build\obj\QA\\" ^
     "src\main.cpp" ^
     "features\FeatureRegistry.cpp" ^
+    "features\GameSessionReportFeature.cpp" ^
     "features\LaptopPowerFeature.cpp" ^
     "libs\imgui\imgui.cpp" ^
     "libs\imgui\imgui_draw.cpp" ^
@@ -48,6 +49,7 @@ link /nologo /OUT:"build\qa\%QA_OUTPUT%" /SUBSYSTEM:WINDOWS ^
     /OPT:REF /OPT:ICF /LTCG /MANIFEST:NO /DEBUG:FULL /IGNORE:4099 /PDB:"build\qa\overlay_uiqa.pdb" ^
     "build\obj\QA\main.obj" ^
     "build\obj\QA\FeatureRegistry.obj" ^
+    "build\obj\QA\GameSessionReportFeature.obj" ^
     "build\obj\QA\LaptopPowerFeature.obj" ^
     "build\obj\QA\imgui.obj" ^
     "build\obj\QA\imgui_draw.obj" ^

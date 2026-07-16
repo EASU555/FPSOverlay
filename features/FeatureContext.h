@@ -11,6 +11,7 @@ struct FeatureContext {
     bool hasCpuTemp = false;
 
     float gpuUsage = 0.0f;
+    bool hasGpuUsage = false;
     float gpuTempC = 0.0f;
     bool hasGpuTemp = false;
     float gpuPowerW = 0.0f;
@@ -47,6 +48,8 @@ struct FeatureContext {
 
     char foregroundWindowTitle[256] = "";
     char gameProcessName[768] = "";
+    char cpuName[256] = "";
+    char gpuName[256] = "";
     DWORD gameProcessId = 0;
     bool isInGame = false;
     bool isOnAcPower = true;

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "imgui.h"
+#include "GameSessionReportFeature.h"
 #include "LaptopPowerFeature.h"
 #include "SettingsUi.h"
 
@@ -195,105 +196,6 @@ private:
     bool featureMadeOverlayVisible_ = false;
 };
 
-class GamePeakStatsFeature final : public Feature {
-public:
-    const char* name() const override { return "游戏实时峰值"; }
-    const char* configKey() const override { return "feature.game_peak_stats"; }
-    bool enabled() const override { return enabled_; }
-    void setEnabled(bool value) override
-    {
-        enabled_ = value;
-        if (!enabled_)
-            Reset();
-    }
-
-    void Update(FeatureContext& context) override
-    {
-        const bool active = enabled_ && context.gameProcessId != 0 &&
-                            (context.isInGame || context.fps > 0.0f);
-        if (!active) {
-            Reset();
-            return;
-        }
-        if (trackedPid_ != context.gameProcessId) {
-            Reset();
-            trackedPid_ = context.gameProcessId;
-        }
-
-        cpuUsagePeak_ = (std::max)(cpuUsagePeak_, context.cpuUsage);
-        gpuUsagePeak_ = (std::max)(gpuUsagePeak_, context.gpuUsage);
-        if (context.hasCpuTemp)
-            cpuTempPeak_ = (std::max)(cpuTempPeak_, context.cpuTempC);
-        if (context.hasGpuTemp)
-            gpuTempPeak_ = (std::max)(gpuTempPeak_, context.gpuTempC);
-        if (context.hasCpuPackagePower)
-            cpuPowerPeak_ = (std::max)(cpuPowerPeak_, context.cpuPackagePowerW);
-        if (context.hasGpuPower)
-            gpuPowerPeak_ = (std::max)(gpuPowerPeak_, context.gpuPowerW);
-    }
-
-    bool DrawSettings(FeatureContext& context) override
-    {
-        bool changed = false;
-        bool value = enabled_;
-        if (ImGui::Checkbox("启用游戏峰值监测", &value)) {
-            setEnabled(value);
-            changed = true;
-        }
-
-        SettingsUi::Status("当前目标：",
-                           trackedPid_ != 0 && context.gameProcessName[0]
-                               ? context.gameProcessName : "未记录",
-                           trackedPid_ != 0);
-        if (ImGui::BeginTable("##game_peak_values", 2,
-                              ImGuiTableFlags_BordersInnerV |
-                              ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("项目", ImGuiTableColumnFlags_WidthStretch, 0.62f);
-            ImGui::TableSetupColumn("峰值", ImGuiTableColumnFlags_WidthStretch, 0.38f);
-            auto row = [](const char* label, float value, const char* format) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                ImGui::TextColored(ImVec4(.55f, .61f, .70f, 1.0f), "%s", label);
-                ImGui::TableNextColumn();
-                if (value > 0.0f)
-                    ImGui::Text(format, value);
-                else
-                    ImGui::TextUnformatted("N/A");
-            };
-            row("CPU 最高占用", cpuUsagePeak_, "%.0f%%");
-            row("CPU 最高温度", cpuTempPeak_, "%.0f°C");
-            row("CPU 最高功耗", cpuPowerPeak_, "%.0f W");
-            row("GPU 最高占用", gpuUsagePeak_, "%.0f%%");
-            row("GPU 最高温度", gpuTempPeak_, "%.0f°C");
-            row("GPU 最高功耗", gpuPowerPeak_, "%.0f W");
-            ImGui::EndTable();
-        }
-        SettingsUi::Muted("只保留当前游戏内存数据，切换或退出游戏后清零");
-        return changed;
-    }
-
-private:
-    void Reset()
-    {
-        trackedPid_ = 0;
-        cpuUsagePeak_ = 0.0f;
-        cpuTempPeak_ = 0.0f;
-        cpuPowerPeak_ = 0.0f;
-        gpuUsagePeak_ = 0.0f;
-        gpuTempPeak_ = 0.0f;
-        gpuPowerPeak_ = 0.0f;
-    }
-
-    bool enabled_ = true;
-    DWORD trackedPid_ = 0;
-    float cpuUsagePeak_ = 0.0f;
-    float cpuTempPeak_ = 0.0f;
-    float cpuPowerPeak_ = 0.0f;
-    float gpuUsagePeak_ = 0.0f;
-    float gpuTempPeak_ = 0.0f;
-    float gpuPowerPeak_ = 0.0f;
-};
-
 TemperatureAlertFeature* AsTemperature(Feature* feature)
 {
     return dynamic_cast<TemperatureAlertFeature*>(feature);
@@ -309,6 +211,11 @@ LaptopPowerFeature* AsLaptopPower(Feature* feature)
     return dynamic_cast<LaptopPowerFeature*>(feature);
 }
 
+GameSessionReportFeature* AsGameSessionReport(Feature* feature)
+{
+    return dynamic_cast<GameSessionReportFeature*>(feature);
+}
+
 } // namespace
 
 FeatureRegistry::FeatureRegistry()
@@ -316,8 +223,8 @@ FeatureRegistry::FeatureRegistry()
     features_.push_back(std::make_unique<TemperatureAlertFeature>());
     features_.push_back(std::make_unique<LowFpsAlertFeature>());
     features_.push_back(std::make_unique<GameAutoOverlayFeature>());
-    features_.push_back(std::make_unique<GamePeakStatsFeature>());
     features_.push_back(std::make_unique<LaptopPowerFeature>());
+    features_.push_back(std::make_unique<GameSessionReportFeature>());
 }
 
 FeatureRegistry::~FeatureRegistry() = default;
@@ -337,8 +244,12 @@ void FeatureRegistry::LoadSettings(const FeatureSettings& settings)
             }
         } else if (std::strcmp(feature->configKey(), "feature.game_auto_overlay") == 0) {
             feature->setEnabled(settings.gameAutoOverlayEnabled);
-        } else if (std::strcmp(feature->configKey(), "feature.game_peak_stats") == 0) {
-            feature->setEnabled(settings.gamePeakStatsEnabled);
+        } else if (std::strcmp(feature->configKey(), "feature.game_session_report") == 0) {
+            feature->setEnabled(settings.gameSessionReportEnabled);
+            if (auto* f = AsGameSessionReport(feature.get())) {
+                f->SetAutoOpen(settings.gameSessionReportAutoOpen);
+                f->SetSaveCsv(settings.gameSessionReportSaveCsv);
+            }
         } else if (std::strcmp(feature->configKey(), "feature.laptop_power") == 0) {
             feature->setEnabled(settings.laptopPowerEnabled);
             if (auto* f = AsLaptopPower(feature.get()))
@@ -363,8 +274,12 @@ FeatureSettings FeatureRegistry::GetSettings() const
             }
         } else if (std::strcmp(feature->configKey(), "feature.game_auto_overlay") == 0) {
             settings.gameAutoOverlayEnabled = feature->enabled();
-        } else if (std::strcmp(feature->configKey(), "feature.game_peak_stats") == 0) {
-            settings.gamePeakStatsEnabled = feature->enabled();
+        } else if (std::strcmp(feature->configKey(), "feature.game_session_report") == 0) {
+            settings.gameSessionReportEnabled = feature->enabled();
+            if (auto* f = AsGameSessionReport(feature.get())) {
+                settings.gameSessionReportAutoOpen = f->AutoOpen();
+                settings.gameSessionReportSaveCsv = f->SaveCsv();
+            }
         } else if (std::strcmp(feature->configKey(), "feature.laptop_power") == 0) {
             settings.laptopPowerEnabled = feature->enabled();
             if (auto* f = AsLaptopPower(feature.get()))
@@ -420,6 +335,33 @@ bool FeatureRegistry::DrawSettings(FeatureContext& context)
         ImGui::PopID();
     }
     return changed;
+}
+
+bool FeatureRegistry::DrawGameSessionReportPage(FeatureContext& context)
+{
+    for (auto& feature : features_) {
+        if (auto* report = AsGameSessionReport(feature.get()))
+            return report->DrawReportPage(context);
+    }
+    return false;
+}
+
+bool FeatureRegistry::ConsumeGameSessionReportOpenRequest()
+{
+    for (auto& feature : features_) {
+        if (auto* report = AsGameSessionReport(feature.get()))
+            return report->ConsumeOpenRequest();
+    }
+    return false;
+}
+
+bool FeatureRegistry::HasCompletedGameSession() const
+{
+    for (const auto& feature : features_) {
+        if (auto* report = AsGameSessionReport(feature.get()))
+            return report->HasCompletedSession();
+    }
+    return false;
 }
 
 bool FeatureRegistry::ToggleLaptopPowerQuickOption(LaptopPowerQuickOption option)

@@ -20,6 +20,9 @@
   - FPS 低于阈值并持续几秒后显示提醒。
 - `GameAutoOverlayFeature`
   - 检测到游戏启动时自动显示 Overlay，游戏退出后自动隐藏。
+- `GameSessionReportFeature`
+  - 稳定识别游戏后每秒从 `FeatureContext` 缓存采样，结束后保留最近一局报告并异步保存 CSV。
+  - 报告包含 FPS、CPU、GPU、内存、显存、整机功耗、用电量、硬件信息和完整时间轴。
 - `LaptopPowerFeature`
   - 显示插电状态、输入功率、电池充电/放电功率、估算整机功耗、CPU Package Power、GPU Power。
   - 无法读取时显示 `N/A`，不会阻止程序启动。
@@ -48,6 +51,9 @@
 feature.temperature_alert=1
 feature.low_fps_alert=1
 feature.game_auto_overlay=0
+feature.game_session_report=1
+feature.game_session_report.auto_open=1
+feature.game_session_report.save_csv=1
 feature.laptop_power=1
 feature.laptop_power.show_overlay=1
 laptop_power.show_system_power=1
@@ -291,7 +297,7 @@ feature.laptop_power.display_mode=1
 ## 版本编号与构建时间
 
 - 版本号集中维护在 `src/version.h`，程序界面、配置、日志和 Windows 文件属性使用同一份版本信息。
-- 当前版本为 `v1.10.37 (2026-07-15 19:11)`。
+- 当前版本为 `v1.10.38 (2026-07-16 14:51)`。
 - 当前功能线每交付一次更新递增修订号。
 - 发布目录保留兼容名称 `overlay.exe`，同时生成带版本和时间的副本，例如 `overlay_v1.10.1_20260620-1925.exe`。
 
@@ -533,3 +539,18 @@ feature.laptop_power.display_mode=1
 - CPU/GPU LHWM 频率与温度、功耗等数据使用同一后台硬件快照，快照完成后才在主线程更新数值和火花线历史。
 - LHWM 完全不可用时，仅使用快速的 Windows CPU 频率回退；游戏运行中不再由绘制线程直接读取 LHWM 频率传感器。
 - 本次不增加功能，不修改 Overlay 风格、七个设置页面、游戏加加布局、指标顺序和绘制样式。
+
+## 游戏结束性能报告（v1.10.38）
+
+- 新增独立 `GameSessionReportFeature`，替换旧的“游戏实时峰值”内存功能；注册顺序位于 `LaptopPowerFeature` 之后，因此整机功耗使用功耗 Feature 已写回的最终缓存。
+- 同一游戏 PID 满足 `isInGame` 或有效 FPS 并稳定 2 秒后开始会话；PID 切换、进程确认退出或连续 5 秒没有游戏目标时结束。
+- 短暂切换桌面、启动器或普通应用不会立即结束；开始新游戏时继续保留上一份已完成报告，直到新游戏真正结束。
+- 每 1000ms 从 `FeatureContext` 采样 FPS、CPU/GPU 占用、温度、功耗、内存、显存和整机功耗，不在报告 Feature 内调用 LHWM、WMI、ETW 或 PDH。
+- 每个指标单独保存有效标记，缺失数据不按 0 参与平均、最低或最高；FPS 的 1% Low 为最低 1% 有效样本的平均值，不使用单个最低值代替。
+- 用电量只对连续有效功耗样本做梯形积分；任何估算样本参与时统一标记“估算用电量”，并显示功耗覆盖率与低覆盖率提示。
+- 新增编号 `08` 的“游戏报告”页面，包含摘要卡、悬停统计、硬件环境和十种可选指标曲线；曲线使用现有 ImGui/ImDrawList 绘制。
+- 有效采样时长达到 30 秒才请求自动打开报告；关闭自动打开不影响最近报告保留和可选 CSV 保存。
+- CSV 保存到程序旁的 `GameSessionReports`，使用 UTF-8 BOM、Unicode 路径、临时文件提交和后台写入线程；退出时等待队列刷新。
+- 静态硬件信息只在初始化时后台查询一次；逐秒采样只读取缓存。单局最多保留 28,800 个逐秒样本，避免超长游戏无限增长。
+- 1% Low 基于每秒 FPS 快照而非逐帧帧时间，因此可用于趋势和场次对比，但精度不等同于 PresentMon 逐帧统计。
+- 未修改游戏加加 `drawSeg()`、Steam、垂直或水平 Overlay 的指标顺序和绘制样式。

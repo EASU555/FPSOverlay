@@ -9,7 +9,9 @@ struct FeatureSettings {
     bool temperatureAlertEnabled = true;
     bool lowFpsAlertEnabled = true;
     bool gameAutoOverlayEnabled = false;
-    bool gamePeakStatsEnabled = true;
+    bool gameSessionReportEnabled = true;
+    bool gameSessionReportAutoOpen = true;
+    bool gameSessionReportSaveCsv = true;
     bool laptopPowerEnabled = true;
 
     int temperatureThresholdC = 85;
@@ -60,6 +62,9 @@ public:
                                    InlineOverlayMetric* output,
                                    size_t capacity) const;
     bool DrawSettings(FeatureContext& context);
+    bool DrawGameSessionReportPage(FeatureContext& context);
+    bool ConsumeGameSessionReportOpenRequest();
+    bool HasCompletedGameSession() const;
     bool ToggleLaptopPowerQuickOption(LaptopPowerQuickOption option);
     bool IsPowerComparisonRecording() const;
     void Shutdown();

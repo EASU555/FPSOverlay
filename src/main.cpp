@@ -795,7 +795,13 @@ static void LoadConfig(OverlayConfig& cfg)
     featureSettings.temperatureAlertEnabled = ReadIniInt("Features", "feature.temperature_alert", 1) != 0;
     featureSettings.lowFpsAlertEnabled = ReadIniInt("Features", "feature.low_fps_alert", 1) != 0;
     featureSettings.gameAutoOverlayEnabled = ReadIniInt("Features", "feature.game_auto_overlay", 0) != 0;
-    featureSettings.gamePeakStatsEnabled = ReadIniInt("Features", "feature.game_peak_stats", 1) != 0;
+    const int legacyGamePeakEnabled = ReadIniInt("Features", "feature.game_peak_stats", 1);
+    featureSettings.gameSessionReportEnabled =
+        ReadIniInt("Features", "feature.game_session_report", legacyGamePeakEnabled) != 0;
+    featureSettings.gameSessionReportAutoOpen =
+        ReadIniInt("Features", "feature.game_session_report.auto_open", 1) != 0;
+    featureSettings.gameSessionReportSaveCsv =
+        ReadIniInt("Features", "feature.game_session_report.save_csv", 1) != 0;
     featureSettings.laptopPowerEnabled = ReadIniInt("Features", "feature.laptop_power", 1) != 0;
     featureSettings.temperatureThresholdC = ReadIniInt("Features", "feature.temperature_alert.threshold_c", 85);
     featureSettings.lowFpsThreshold = ReadIniInt("Features", "feature.low_fps_alert.threshold", 45);
@@ -975,7 +981,10 @@ static bool SaveConfig(const OverlayConfig& cfg)
     WriteIniInt("Features", "feature.temperature_alert", featureSettings.temperatureAlertEnabled ? 1 : 0);
     WriteIniInt("Features", "feature.low_fps_alert", featureSettings.lowFpsAlertEnabled ? 1 : 0);
     WriteIniInt("Features", "feature.game_auto_overlay", featureSettings.gameAutoOverlayEnabled ? 1 : 0);
-    WriteIniInt("Features", "feature.game_peak_stats", featureSettings.gamePeakStatsEnabled ? 1 : 0);
+    WriteIniInt("Features", "feature.game_session_report", featureSettings.gameSessionReportEnabled ? 1 : 0);
+    WriteIniInt("Features", "feature.game_session_report.auto_open", featureSettings.gameSessionReportAutoOpen ? 1 : 0);
+    WriteIniInt("Features", "feature.game_session_report.save_csv", featureSettings.gameSessionReportSaveCsv ? 1 : 0);
+    WriteIniInt("Features", "feature.game_peak_stats", featureSettings.gameSessionReportEnabled ? 1 : 0);
     WriteIniInt("Features", "feature.laptop_power", featureSettings.laptopPowerEnabled ? 1 : 0);
     WriteIniInt("Features", "feature.temperature_alert.threshold_c", featureSettings.temperatureThresholdC);
     WriteIniInt("Features", "feature.low_fps_alert.threshold", featureSettings.lowFpsThreshold);
@@ -6279,10 +6288,12 @@ static void UpdateFeatureContext(float fps, float cpuUsage, float ramUsed, float
     ctx.hasCpuPlatformPower = ValidLaptopPowerValue(g_cpuPlatformPower);
     {
         std::lock_guard<std::mutex> lock(g_lhwmStateMutex);
+        ctx.hasGpuUsage = !g_lhwmGpuLoadPath.empty();
         ctx.gpuPowerIsDiscrete =
             g_lhwmGpuPowerPath.find("/gpu-nvidia/") != std::string::npos ||
             g_lhwmGpuPowerPath.find("/gpu-amd/") != std::string::npos;
         ctx.diskCount = static_cast<int>(g_lhwmDiskActivityPaths.size());
+        snprintf(ctx.gpuName, sizeof(ctx.gpuName), "%s", g_gpuName);
     }
     ctx.powerSensorSampleSequence =
         g_comparisonPowerSampleSequence.load(std::memory_order_acquire);
@@ -6329,6 +6340,7 @@ static void UpdateFeatureContext(float fps, float cpuUsage, float ramUsed, float
     snprintf(ctx.foregroundWindowTitle, sizeof(ctx.foregroundWindowTitle), "%s",
              s_cachedForegroundTitle);
     snprintf(ctx.gameProcessName, sizeof(ctx.gameProcessName), "%s", g_targetProcessName);
+    snprintf(ctx.cpuName, sizeof(ctx.cpuName), "%s", g_cpuName);
     ctx.gameProcessId = g_targetPid.load(std::memory_order_relaxed);
     ctx.isInGame = g_ForegroundGameConfirmed;
 
@@ -7879,6 +7891,7 @@ enum SettingsPageId {
     SETTINGS_CONTROL,
     SETTINGS_HARDWARE,
     SETTINGS_FEATURES,
+    SETTINGS_GAME_REPORT,
 };
 
 static int g_settingsPage = SETTINGS_HOME;
@@ -7892,6 +7905,7 @@ static const char* SettingsPageTitle(int page)
     case SETTINGS_CONTROL:  return "控制与启动";
     case SETTINGS_HARDWARE: return "硬件信息";
     case SETTINGS_FEATURES: return "提醒与功耗";
+    case SETTINGS_GAME_REPORT: return "游戏报告";
     default:                return "控制中心";
     }
 }
@@ -7905,6 +7919,7 @@ static const char* SettingsPageDescription(int page)
     case SETTINGS_CONTROL:  return "配置快捷键、Windows 自启动和程序启动行为";
     case SETTINGS_HARDWARE: return "查看传感器状态、选择 GPU 并导出诊断信息";
     case SETTINGS_FEATURES: return "配置温度、低帧率、自动显示和整机功耗功能";
+    case SETTINGS_GAME_REPORT: return "最近一次游戏性能记录";
     default:                return "实时状态、常用开关和硬件概览";
     }
 }
@@ -7918,6 +7933,7 @@ static const char* SettingsPageCode(int page)
     case SETTINGS_CONTROL:  return "05";
     case SETTINGS_HARDWARE: return "06";
     case SETTINGS_FEATURES: return "07";
+    case SETTINGS_GAME_REPORT: return "08";
     default:                return "01";
     }
 }
@@ -8530,6 +8546,7 @@ static void DrawSettingsPageContent(bool& changed)
     case SETTINGS_CONTROL:  DrawSettingsControl(changed); break;
     case SETTINGS_HARDWARE: DrawSettingsHardware(changed); break;
     case SETTINGS_FEATURES: changed |= g_FeatureRegistry.DrawSettings(g_FeatureContext); break;
+    case SETTINGS_GAME_REPORT: changed |= g_FeatureRegistry.DrawGameSessionReportPage(g_FeatureContext); break;
     default:                DrawSettingsHome(changed); break;
     }
 }
@@ -8600,6 +8617,7 @@ static void DrawSettingsSidebar(bool liveSettings)
     DrawSettingsNavItem("控制与启动", "快捷键和自启动", SETTINGS_CONTROL);
     DrawSettingsNavItem("硬件信息", "传感器与诊断", SETTINGS_HARDWARE);
     DrawSettingsNavItem("提醒与功耗", "告警和整机模型", SETTINGS_FEATURES);
+    DrawSettingsNavItem("游戏报告", "最近一次游戏性能记录", SETTINGS_GAME_REPORT);
 
     const float footerHeight = 110.0f * g_dpiScale;
     if (ImGui::GetContentRegionAvail().y > footerHeight)
@@ -8876,6 +8894,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             if (msg.message == WM_QUIT) g_Running = false;
         }
         if (!g_Running) break;
+        if (g_FeatureRegistry.ConsumeGameSessionReportOpenRequest()) {
+            g_settingsPage = SETTINGS_GAME_REPORT;
+            QueueShowSettings();
+        }
         if (g_Mode == MODE_OVERLAY &&
             (g_OverlayHostRecoveryPending || !g_hwnd || !IsWindow(g_hwnd))) {
             if (!RecoverOverlayHostWindow()) {

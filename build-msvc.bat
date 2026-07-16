@@ -48,6 +48,7 @@ if %ERRORLEVEL% EQU 0 (
         /Fo"build\obj\Release\\" ^
         "src\main.cpp" ^
         "features\FeatureRegistry.cpp" ^
+        "features\GameSessionReportFeature.cpp" ^
         "features\LaptopPowerFeature.cpp" ^
         "libs\imgui\imgui.cpp" ^
         "libs\imgui\imgui_draw.cpp" ^
@@ -60,6 +61,7 @@ if %ERRORLEVEL% EQU 0 (
         /OPT:REF /OPT:ICF /LTCG /MANIFEST:NO /DEBUG:FULL /IGNORE:4099 /PDB:"build\overlay\overlay.pdb" ^
         "build\obj\Release\main.obj" ^
         "build\obj\Release\FeatureRegistry.obj" ^
+        "build\obj\Release\GameSessionReportFeature.obj" ^
         "build\obj\Release\LaptopPowerFeature.obj" ^
         "build\obj\Release\imgui.obj" ^
         "build\obj\Release\imgui_draw.obj" ^
