@@ -1194,10 +1194,12 @@ bool LaptopPowerFeature::DrawSettings(FeatureContext& context)
     changed |= ImGui::Checkbox("允许估算整机功耗", &allowEstimatedSystemPower_);
     changed |= ImGui::Checkbox("启用电池偷电提醒", &batteryAssistAlertEnabled_);
     ImGui::BeginDisabled(!batteryAssistAlertEnabled_);
+    SettingsUi::Muted("提醒阈值");
     ImGui::SetNextItemWidth(-1.0f);
-    changed |= ImGui::SliderInt("提醒阈值 W##battery_assist", &batteryAssistThresholdW_, 1, 30, "%d W");
+    changed |= ImGui::SliderInt("##battery_assist_threshold", &batteryAssistThresholdW_, 1, 30, "%d W");
+    SettingsUi::Muted("持续时间");
     ImGui::SetNextItemWidth(-1.0f);
-    changed |= ImGui::SliderInt("持续秒数##battery_assist", &batteryAssistSeconds_, 1, 60, "%d 秒");
+    changed |= ImGui::SliderInt("##battery_assist_duration", &batteryAssistSeconds_, 1, 60, "%d 秒");
     ImGui::EndDisabled();
 
     SettingsUi::Subsection("实时状态", "当前数据不受悬浮窗显示开关影响");

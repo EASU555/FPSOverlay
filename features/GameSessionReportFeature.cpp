@@ -1081,20 +1081,14 @@ void DrawSummaryTile(const char* id, const char* label, const std::string& value
                      const char* secondaryLabel = nullptr,
                      const char* secondarySuffix = "")
 {
-    const float horizontalPadding = 12.0f;
-    const float verticalPadding = 10.0f;
-    const float availableWidth = (std::max)(
-        0.0f, ImGui::GetContentRegionAvail().x - horizontalPadding * 2.0f);
-    const float combinedWidth = ImGui::CalcTextSize(value.c_str()).x +
-                                ImGui::CalcTextSize(detail.c_str()).x + 8.0f;
-    const bool detailUsesOwnLine = !detail.empty() && combinedWidth > availableWidth;
-    const int textLines = detailUsesOwnLine ? 3 : 2;
+    const float verticalPadding = 8.0f;
+    const int textLines = detail.empty() ? 2 : 3;
     const float tileHeight = (std::max)(
-        88.0f,
+        78.0f,
         verticalPadding * 2.0f +
             ImGui::GetTextLineHeight() * static_cast<float>(textLines) +
             ImGui::GetStyle().ItemSpacing.y * static_cast<float>(textLines - 1) + 4.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(11.0f, verticalPadding));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, SettingsUi::Surface2());
     ImGui::PushStyleColor(ImGuiCol_Border, SettingsUi::Hairline());
@@ -1106,13 +1100,13 @@ void DrawSummaryTile(const char* id, const char* label, const std::string& value
     ImGui::GetWindowDrawList()->AddRectFilled(
         tileStart, ImVec2(tileStart.x + 2.0f, tileStart.y + tileSize.y),
         ImGui::ColorConvertFloat4ToU32(color), 1.0f);
+    ImGui::GetWindowDrawList()->AddRectFilled(
+        tileStart, ImVec2(tileStart.x + 28.0f, tileStart.y + 2.0f),
+        ImGui::ColorConvertFloat4ToU32(color), 1.0f);
     SettingsUi::Muted("%s", label);
     ImGui::TextColored(color, "%s", value.c_str());
-    if (!detail.empty()) {
-        if (!detailUsesOwnLine)
-            ImGui::SameLine(0.0f, 8.0f);
+    if (!detail.empty())
         SettingsUi::Muted("%s", detail.c_str());
-    }
     ImGui::EndChild();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(2);
@@ -2227,7 +2221,7 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
             historyStyle.CellPadding.x * 2.0f;
         const float durationColumnWidth =
             (std::max)(ImGui::CalcTextSize("时长").x,
-                       ImGui::CalcTextSize("99 小时 59 分钟").x) +
+                       ImGui::CalcTextSize("99 小时 59 分钟 59 秒").x) +
             historyStyle.CellPadding.x * 2.0f;
         const float startColumnWidth =
             ImGui::CalcTextSize("2026-07-16 17:28:15").x +
@@ -2461,20 +2455,21 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
     const std::string powerDetail =
         report->energyIncludesEstimate ? "软件估算" : "真实传感器";
     const float tileAreaWidth = ImGui::GetContentRegionAvail().x;
-    const auto valueLineWidth = [](const std::string& value,
-                                   const std::string& detail) {
-        return ImGui::CalcTextSize(value.c_str()).x +
-               (detail.empty() ? 0.0f : ImGui::CalcTextSize(detail.c_str()).x + 8.0f);
+    const auto tileTextWidth = [](const char* label, const std::string& value,
+                                  const std::string& detail) {
+        return (std::max)(ImGui::CalcTextSize(label).x,
+                          (std::max)(ImGui::CalcTextSize(value.c_str()).x,
+                                     ImGui::CalcTextSize(detail.c_str()).x));
     };
-    float tileMinimumWidth = ImGui::GetFontSize() * 10.5f;
+    float tileMinimumWidth = ImGui::GetFontSize() * 8.5f;
     tileMinimumWidth = (std::max)(tileMinimumWidth,
-                                  valueLineWidth(fpsValue, fpsDetail) + 24.0f);
+                                  tileTextWidth("平均 FPS", fpsValue, fpsDetail) + 24.0f);
     tileMinimumWidth = (std::max)(tileMinimumWidth,
-                                  valueLineWidth(cpuValue, cpuDetail) + 24.0f);
+                                  tileTextWidth("CPU 平均占用", cpuValue, cpuDetail) + 24.0f);
     tileMinimumWidth = (std::max)(tileMinimumWidth,
-                                  valueLineWidth(gpuValue, gpuDetail) + 24.0f);
+                                  tileTextWidth("GPU 平均占用", gpuValue, gpuDetail) + 24.0f);
     tileMinimumWidth = (std::max)(tileMinimumWidth,
-                                  valueLineWidth(powerValue, powerDetail) + 24.0f);
+                                  tileTextWidth("平均整机功耗", powerValue, powerDetail) + 24.0f);
     const float tileStride =
         tileMinimumWidth + ImGui::GetStyle().CellPadding.x * 2.0f;
     const int tileColumns = std::clamp(

@@ -8006,11 +8006,9 @@ static const char* SettingsPageCode(int page)
 static bool DrawSettingsNavItem(const char* label, const char* hint, int page)
 {
     ImGui::PushID(page);
-    const bool compact =
-        ImGui::GetIO().DisplaySize.x < 820.0f * g_dpiScale;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const float width = ImGui::GetContentRegionAvail().x;
-    const float height = (compact ? 42.0f : 48.0f) * g_dpiScale;
+    const float height = 40.0f * g_dpiScale;
     const bool pressed = ImGui::InvisibleButton("##nav", ImVec2(width, height));
     const bool hovered = ImGui::IsItemHovered();
     const bool selected = g_settingsPage == page;
@@ -8019,42 +8017,44 @@ static bool DrawSettingsNavItem(const char* label, const char* hint, int page)
     if (selected || hovered) {
         dl->AddRectFilled(
             pos, ImVec2(pos.x + width, pos.y + height),
-            selected ? IM_COL32(28, 46, 70, 245) : IM_COL32(28, 34, 44, 235),
-            6.0f * g_dpiScale);
+            selected ? IM_COL32(31, 45, 57, 255) : IM_COL32(34, 35, 42, 255),
+            2.0f * g_dpiScale);
     }
     if (selected) {
         dl->AddRectFilled(
             pos, ImVec2(pos.x + 3.0f * g_dpiScale, pos.y + height),
-            IM_COL32(74, 160, 250, 255), 2.0f * g_dpiScale);
+            IM_COL32(13, 156, 235, 255), 1.0f * g_dpiScale);
     }
 
+    const float codeSize = 20.0f * g_dpiScale;
     const ImVec2 codeMin(pos.x + 9.0f * g_dpiScale,
-                         pos.y + 10.0f * g_dpiScale);
-    const ImVec2 codeMax(codeMin.x + 22.0f * g_dpiScale,
-                         codeMin.y + 22.0f * g_dpiScale);
+                         pos.y + (height - codeSize) * 0.5f);
+    const ImVec2 codeMax(codeMin.x + codeSize, codeMin.y + codeSize);
     dl->AddRectFilled(codeMin, codeMax,
-                      selected ? IM_COL32(61, 126, 224, 185)
-                               : IM_COL32(39, 51, 78, 225),
-                       4.0f * g_dpiScale);
-    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.72f,
-                 ImVec2(codeMin.x + 4.5f * g_dpiScale,
-                        codeMin.y + 4.0f * g_dpiScale),
-                selected ? IM_COL32(235, 245, 255, 255)
-                         : IM_COL32(137, 151, 178, 255),
+                      selected ? IM_COL32(10, 119, 181, 255)
+                               : IM_COL32(49, 50, 59, 255),
+                      2.0f * g_dpiScale);
+    const float codeFontSize = ImGui::GetFontSize() * 0.68f;
+    const ImVec2 codeTextSize = ImGui::GetFont()->CalcTextSizeA(
+        codeFontSize, FLT_MAX, 0.0f, SettingsPageCode(page));
+    dl->AddText(ImGui::GetFont(), codeFontSize,
+                 ImVec2(codeMin.x + (codeSize - codeTextSize.x) * 0.5f,
+                        codeMin.y + (codeSize - codeTextSize.y) * 0.5f),
+                selected ? IM_COL32(241, 249, 255, 255)
+                         : IM_COL32(139, 143, 156, 255),
                 SettingsPageCode(page));
     dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-                 ImVec2(pos.x + (compact ? 39.0f : 42.0f) * g_dpiScale,
-                        pos.y + (compact ? 10.5f : 5.0f) * g_dpiScale),
-                selected ? IM_COL32(235, 244, 255, 255)
-                         : IM_COL32(190, 201, 222, 255),
+                 ImVec2(pos.x + 38.0f * g_dpiScale,
+                        pos.y + (height - ImGui::GetFontSize()) * 0.5f),
+                selected ? IM_COL32(239, 244, 248, 255)
+                         : IM_COL32(184, 187, 198, 255),
                 label);
-    if (!compact) {
-        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.76f,
-                     ImVec2(pos.x + 42.0f * g_dpiScale,
-                            pos.y + 26.0f * g_dpiScale),
-                    selected ? IM_COL32(129, 158, 199, 255)
-                             : IM_COL32(104, 119, 146, 255),
-                    hint);
+
+    if (hovered && hint && hint[0]) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(label);
+        SettingsUi::Muted("%s", hint);
+        ImGui::EndTooltip();
     }
 
     if (pressed)
@@ -8108,39 +8108,67 @@ static void DrawSettingsStatusRail()
     const float available = ImGui::GetContentRegionAvail().x;
     const int columns = available > 840.0f * g_dpiScale ? 4 :
                         (available > 430.0f * g_dpiScale ? 2 : 1);
+    const int rows = (4 + columns - 1) / columns;
+    const float stripHeight = rows * 64.0f * g_dpiScale + 2.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, SettingsUi::Surface1());
+    ImGui::PushStyleColor(ImGuiCol_Border, SettingsUi::Hairline());
+    ImGui::BeginChild("##status_strip", ImVec2(0.0f, stripHeight),
+                      ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const ImVec2 stripPos = ImGui::GetWindowPos();
+    ImGui::GetWindowDrawList()->AddRectFilled(
+        ImVec2(stripPos.x + 1.0f, stripPos.y + 1.0f),
+        ImVec2(stripPos.x + 52.0f * g_dpiScale, stripPos.y + 3.0f * g_dpiScale),
+        ImGui::ColorConvertFloat4ToU32(SettingsUi::Accent()));
+
+    const auto drawCell = [](const char* label, const char* value,
+                             const char* detail, const ImVec4& color) {
+        const float contentWidth = ImGui::GetContentRegionAvail().x;
+        SettingsUi::Muted("%s", label);
+        ImGui::TextColored(color, "%s", value);
+        if (detail && detail[0]) {
+            const float combined = ImGui::CalcTextSize(value).x +
+                ImGui::CalcTextSize(detail).x + 8.0f;
+            if (combined <= contentWidth)
+                ImGui::SameLine(0.0f, 8.0f);
+            SettingsUi::Muted("%s", detail);
+        }
+    };
+
     if (ImGui::BeginTable("##status_rail", columns,
-                          ImGuiTableFlags_SizingStretchSame)) {
+                          ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_BordersInnerH)) {
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_overlay", "覆盖层",
-                               overlayActive ? "运行中" :
-                               (g_Mode == MODE_CONFIG ? "待启动" : "已隐藏"),
-                               "实时状态",
-                               overlayActive ? SettingsUi::Success()
-                                             : SettingsUi::Warning());
+        drawCell("覆盖层",
+                 overlayActive ? "运行中" :
+                     (g_Mode == MODE_CONFIG ? "待启动" : "已隐藏"),
+                 "实时状态",
+                 overlayActive ? SettingsUi::Success() : SettingsUi::Warning());
 
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_sensors", "传感器",
-                               sensorState, sensorHint,
-                               sensorsReady && !sensorsStale &&
-                                       (recoveryStatus == PowerRecoveryStatus::Idle ||
-                                        recoveryStatus == PowerRecoveryStatus::Recovered)
-                                   ? SettingsUi::Success()
-                                   : SettingsUi::Warning());
+        drawCell("传感器", sensorState, sensorHint,
+                 sensorsReady && !sensorsStale &&
+                         (recoveryStatus == PowerRecoveryStatus::Idle ||
+                          recoveryStatus == PowerRecoveryStatus::Recovered)
+                     ? SettingsUi::Success()
+                     : SettingsUi::Warning());
 
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_power", "整机功耗",
-                               powerValue,
-                               powerReady ? "自动融合" : "暂无来源",
-                               powerReady ? SettingsUi::Accent()
-                                          : SettingsUi::Warning());
+        drawCell("整机功耗", powerValue,
+                 powerReady ? "自动融合" : "暂无来源",
+                 powerReady ? SettingsUi::Warning() : SettingsUi::MutedColor());
 
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_layout", "当前布局",
-                               CurrentLayoutName(),
-                               "当前配置",
-                               SettingsUi::Violet());
+        drawCell("当前布局", CurrentLayoutName(), "当前配置",
+                 SettingsUi::Accent());
         ImGui::EndTable();
     }
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
     ImGui::Spacing();
 }
 
@@ -8225,12 +8253,14 @@ static void DrawSettingsMonitor(bool& changed)
                 changed |= ImGui::Checkbox("使用最近 60 秒平均 FPS", &g_Config.useAverageFPS);
                 changed |= ImGui::Checkbox("自定义 FPS 颜色阈值", &g_Config.customFpsColors);
                 ImGui::BeginDisabled(!g_Config.customFpsColors);
+                SettingsUi::Muted("红色上限");
                 ImGui::SetNextItemWidth(-1.0f);
-                changed |= ImGui::SliderInt("红色上限##fps_color",
+                changed |= ImGui::SliderInt("##fps_warning_threshold",
                                             &g_Config.fpsWarningThreshold,
                                             15, g_Config.fpsGoodThreshold - 1, "%d FPS");
+                SettingsUi::Muted("绿色起点");
                 ImGui::SetNextItemWidth(-1.0f);
-                changed |= ImGui::SliderInt("绿色起点##fps_color",
+                changed |= ImGui::SliderInt("##fps_good_threshold",
                                             &g_Config.fpsGoodThreshold,
                                             g_Config.fpsWarningThreshold + 1, 240, "%d FPS");
                 ImGui::EndDisabled();
@@ -8240,8 +8270,9 @@ static void DrawSettingsMonitor(bool& changed)
             if (g_Config.showTime) {
                 changed |= ImGui::Checkbox("显示秒数", &g_Config.timeShowSeconds);
                 const char* timeFormats[] = { "24 小时制", "12 小时制" };
+                SettingsUi::Muted("时间格式");
                 ImGui::SetNextItemWidth(-1.0f);
-                changed |= ImGui::Combo("时间格式", &g_Config.timeFormat, timeFormats, 2);
+                changed |= ImGui::Combo("##time_format", &g_Config.timeFormat, timeFormats, 2);
             }
         }
         SettingsUi::EndCard();
@@ -8491,8 +8522,9 @@ static void DrawSettingsHardware(bool& changed)
                 (selectedGpuSnapshot >= 0 &&
                  selectedGpuSnapshot < static_cast<int>(gpuSnapshot.size()))
                     ? gpuSnapshot[selectedGpuSnapshot].name : "选择 GPU...";
+            SettingsUi::Muted("监控 GPU");
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::BeginCombo("监控 GPU", preview)) {
+            if (ImGui::BeginCombo("##monitor_gpu", preview)) {
                 for (int i = 0; i < static_cast<int>(gpuSnapshot.size()); ++i) {
                     const bool selected = selectedGpuSnapshot == i;
                     if (ImGui::Selectable(gpuSnapshot[i].name, selected)) {
@@ -8613,42 +8645,30 @@ static void DrawSettingsSidebar(bool liveSettings)
 {
     const bool compact =
         ImGui::GetIO().DisplaySize.x < 820.0f * g_dpiScale;
-    const float sidebarWidth = (compact ? 150.0f : 204.0f) * g_dpiScale;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.024f, 0.029f, 0.038f, 1.0f));
+    const float sidebarWidth = (compact ? 142.0f : 168.0f) * g_dpiScale;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.052f, 0.054f, 0.065f, 1.0f));
     ImGui::BeginChild("##settings_sidebar", ImVec2(sidebarWidth, 0.0f),
                       ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
 
     const float brandX = ImGui::GetCursorPosX();
     const float brandY = ImGui::GetCursorPosY();
     const ImVec2 brandScreen = ImGui::GetCursorScreenPos();
-    const float badgeSize = (compact ? 30.0f : 34.0f) * g_dpiScale;
     ImDrawList* sidebarDraw = ImGui::GetWindowDrawList();
     sidebarDraw->AddRectFilled(
         brandScreen,
-        ImVec2(brandScreen.x + badgeSize, brandScreen.y + badgeSize),
-        IM_COL32(45, 103, 202, 255), 6.0f * g_dpiScale);
-    sidebarDraw->AddRectFilled(
-        ImVec2(brandScreen.x + badgeSize * 0.52f, brandScreen.y),
-        ImVec2(brandScreen.x + badgeSize, brandScreen.y + badgeSize),
-        IM_COL32(106, 83, 217, 190), 6.0f * g_dpiScale,
-        ImDrawFlags_RoundCornersRight);
-    sidebarDraw->AddText(
-        ImGui::GetFont(), ImGui::GetFontSize() * 0.72f,
-        ImVec2(brandScreen.x + 6.0f * g_dpiScale,
-               brandScreen.y + 9.0f * g_dpiScale),
-        IM_COL32(245, 249, 255, 255), "FPS");
+        ImVec2(brandScreen.x + 3.0f * g_dpiScale,
+               brandScreen.y + 35.0f * g_dpiScale),
+        IM_COL32(13, 156, 235, 255));
 
-    ImGui::SetCursorPos(ImVec2(brandX + (compact ? 39.0f : 44.0f) * g_dpiScale,
-                               brandY));
-    ImGui::SetWindowFontScale(compact ? 1.0f : 1.10f);
-    ImGui::TextColored(ImVec4(0.92f, 0.95f, 1.0f, 1.0f), "FPS OVERLAY");
+    ImGui::SetCursorPos(ImVec2(brandX + 11.0f * g_dpiScale, brandY));
+    ImGui::SetWindowFontScale(compact ? 1.0f : 1.08f);
+    ImGui::TextColored(SettingsUi::TextColor(), "FPS");
+    ImGui::SameLine(0.0f, 4.0f * g_dpiScale);
+    ImGui::TextColored(SettingsUi::Accent(), "OVERLAY");
     ImGui::SetWindowFontScale(1.0f);
-    ImGui::SetCursorPosX(brandX + (compact ? 39.0f : 44.0f) * g_dpiScale);
-    ImGui::TextColored(SettingsUi::MutedColor(),
-                       compact ? "CONTROL" : "MONITOR CONTROL");
-    ImGui::SetCursorPosY(brandY + (compact ? 38.0f : 43.0f) * g_dpiScale);
-    ImGui::TextColored(SettingsUi::MutedColor(), "%s",
-                       compact ? VER_SHORT_STRING : APP_VERSION);
+    ImGui::SetCursorPosX(brandX + 11.0f * g_dpiScale);
+    SettingsUi::Muted("%s", VER_SHORT_STRING);
+    ImGui::SetCursorPosY(brandY + 42.0f * g_dpiScale);
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -8677,16 +8697,16 @@ static void DrawSettingsSidebar(bool liveSettings)
     DrawSettingsNavItem("提醒与功耗", "告警和整机模型", SETTINGS_FEATURES);
     DrawSettingsNavItem("游戏报告", "历史记录与性能曲线", SETTINGS_GAME_REPORT);
 
-    const float footerHeight = 110.0f * g_dpiScale;
+    const float footerHeight = 86.0f * g_dpiScale;
     if (ImGui::GetContentRegionAvail().y > footerHeight)
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
                              ImGui::GetContentRegionAvail().y - footerHeight);
     ImGui::Separator();
     const bool overlayActive = g_Mode == MODE_OVERLAY && g_OvlVisible;
-    SettingsUi::Status("Overlay",
-                       overlayActive ? "运行中" :
-                       (g_Mode == MODE_CONFIG ? "尚未启动" : "已隐藏"),
-                       overlayActive);
+    SettingsUi::Muted("OVERLAY STATUS");
+    ImGui::TextColored(overlayActive ? SettingsUi::Success() : SettingsUi::Warning(),
+                       "%s", overlayActive ? "运行中" :
+                           (g_Mode == MODE_CONFIG ? "尚未启动" : "已隐藏"));
     if (liveSettings) {
         if (ImGui::Button("关闭设置", ImVec2(-1.0f, 0.0f))) {
             g_ShowLiveSettings = false;
@@ -8707,33 +8727,30 @@ static void DrawSettingsDashboard(bool liveSettings, bool& changed)
     ImGui::SameLine(0.0f, 0.0f);
     ImGui::BeginChild("##settings_content", ImVec2(0.0f, 0.0f),
                       ImGuiChildFlags_AlwaysUseWindowPadding);
-    const ImVec2 codePos = ImGui::GetCursorScreenPos();
-    const ImVec2 codeSize(34.0f * g_dpiScale, 26.0f * g_dpiScale);
-    const ImVec2 codeMax(codePos.x + codeSize.x, codePos.y + codeSize.y);
-    ImGui::Dummy(codeSize);
-    ImDrawList* contentDraw = ImGui::GetWindowDrawList();
-    contentDraw->AddRectFilled(codePos, codeMax,
-                               IM_COL32(27, 48, 75, 255), 4.0f * g_dpiScale);
-    contentDraw->AddRect(codePos, codeMax,
-                         IM_COL32(69, 139, 226, 170), 4.0f * g_dpiScale);
-    contentDraw->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.78f,
-                         ImVec2(codePos.x + 8.0f * g_dpiScale,
-                                codePos.y + 5.0f * g_dpiScale),
-                         IM_COL32(177, 215, 255, 255), SettingsPageCode(g_settingsPage));
-    ImGui::SameLine(0.0f, 10.0f * g_dpiScale);
-    ImGui::SetWindowFontScale(1.34f);
-    ImGui::TextColored(SettingsUi::TextColor(), "%s", SettingsPageTitle(g_settingsPage));
+    const float headerWidth = ImGui::GetContentRegionAvail().x;
+    const char* pageTitle = SettingsPageTitle(g_settingsPage);
+    const char* pageDescription = SettingsPageDescription(g_settingsPage);
+    ImGui::SetWindowFontScale(1.16f);
+    ImGui::TextColored(SettingsUi::Accent(), "%s", pageTitle);
     ImGui::SetWindowFontScale(1.0f);
-    SettingsUi::MutedWrapped("%s", SettingsPageDescription(g_settingsPage));
-    ImGui::Spacing();
+    const float inlineHeaderWidth = ImGui::CalcTextSize(pageTitle).x * 1.16f +
+        ImGui::CalcTextSize(pageDescription).x + 28.0f * g_dpiScale;
+    if (inlineHeaderWidth <= headerWidth) {
+        ImGui::SameLine(0.0f, 14.0f * g_dpiScale);
+        ImGui::TextColored(SettingsUi::MutedColor(), "%s", pageDescription);
+    } else {
+        SettingsUi::MutedWrapped("%s", pageDescription);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 2.0f * g_dpiScale));
+    ImDrawList* contentDraw = ImGui::GetWindowDrawList();
     const ImVec2 railStart = ImGui::GetCursorScreenPos();
     const float railWidth = ImGui::GetContentRegionAvail().x;
     contentDraw->AddLine(railStart, ImVec2(railStart.x + railWidth, railStart.y),
-                         IM_COL32(48, 58, 73, 230), 1.0f * g_dpiScale);
+                         IM_COL32(55, 57, 66, 255), 1.0f * g_dpiScale);
     contentDraw->AddLine(
         railStart,
-        ImVec2(railStart.x + (std::min)(railWidth, 56.0f * g_dpiScale), railStart.y),
-        IM_COL32(74, 160, 250, 255), 2.0f * g_dpiScale);
+        ImVec2(railStart.x + (std::min)(railWidth, 64.0f * g_dpiScale), railStart.y),
+        IM_COL32(13, 156, 235, 255), 2.0f * g_dpiScale);
     ImGui::Dummy(ImVec2(railWidth, 1.0f * g_dpiScale));
     ImGui::Spacing();
     DrawSettingsPageContent(changed);
