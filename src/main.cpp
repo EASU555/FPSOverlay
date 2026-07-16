@@ -2424,6 +2424,9 @@ static bool IsKnownDesktopProcess(const char* exeName)
         "unrealcefsubprocess.exe", "cefsharp.browsersubprocess.exe",
         "clash-verge.exe", "clash-verge-service.exe", "baidunetdisk.exe",
         "leigod.exe", "ace-tray.exe", "ace-service.exe",
+        "gameguard.des", "gameguard.exe", "gamemon.des", "gamemon64.des",
+        "easyanticheat.exe", "easyanticheat_eos.exe",
+        "beservice.exe", "beservice_x64.exe", "start_protected_game.exe",
         "bilibili.exe", "potplayermini64.exe", "potplayermini.exe", "vlc.exe",
         "wallpaper64.exe", "wallpaper32.exe", "wallpaperservice32.exe"
     };
@@ -8775,6 +8778,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             g_Config.autoStart ? 1 : 0,
             g_Config.startWithWindows ? 1 : 0,
             g_Config.layoutStyle, g_Config.overlayScale);
+#if defined(FPSOVERLAY_UI_QA)
+    if (!IsKnownDesktopProcess("GameGuard.des (nProtect GameGuard Launcher)") ||
+        !IsKnownDesktopProcess("EasyAntiCheat_EOS.exe") ||
+        IsKnownDesktopProcess("helldivers2.exe (HELLDIVERS 2)")) {
+        std::terminate();
+    }
+#endif
     g_FeatureRegistry.Init();
 
     // ── Show welcome message on first run ──
