@@ -6901,6 +6901,23 @@ static void RefreshDpiScale(HWND hwnd)
     if (g_dpiScale > 4.0f) g_dpiScale = 4.0f;
 }
 
+static void ApplyConfigWindowChrome(HWND hwnd)
+{
+    if (!hwnd)
+        return;
+
+    // Numeric attributes keep this compatible with older Windows SDK headers.
+    const BOOL darkMode = TRUE;
+    constexpr DWORD kImmersiveDarkModeAttribute = 20;
+    DwmSetWindowAttribute(hwnd, kImmersiveDarkModeAttribute,
+                          &darkMode, sizeof(darkMode));
+
+    const DWORD roundedCorner = 2; // DWMWCP_ROUND
+    constexpr DWORD kCornerPreferenceAttribute = 33;
+    DwmSetWindowAttribute(hwnd, kCornerPreferenceAttribute,
+                          &roundedCorner, sizeof(roundedCorner));
+}
+
 static void EnableProcessDpiAwareness()
 {
     HMODULE user32 = GetModuleHandleA("user32.dll");
@@ -6916,9 +6933,12 @@ static void EnableProcessDpiAwareness()
     }
 }
 
+static ImFont* g_SettingsFont = nullptr;
+
 static void BuildUiFontAtlas(ImGuiIO& io)
 {
     io.Fonts->Clear();
+    g_SettingsFont = nullptr;
 
     ImFontGlyphRangesBuilder glyphBuilder;
     glyphBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
@@ -6949,7 +6969,33 @@ static void BuildUiFontAtlas(ImGuiIO& io)
     if (!font) {
         ImFontConfig fc;
         fc.SizePixels = 16.0f * g_dpiScale;
-        io.Fonts->AddFontDefault(&fc);
+        font = io.Fonts->AddFontDefault(&fc);
+    }
+    io.FontDefault = font;
+
+    // Keep the Overlay font unchanged. Settings use Segoe UI Variable for
+    // clearer numbers/Latin labels, then merge Microsoft YaHei for Chinese.
+    ImFontGlyphRangesBuilder settingsLatinBuilder;
+    settingsLatinBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+    settingsLatinBuilder.AddChar((ImWchar)0x2122);
+    static ImVector<ImWchar> s_settingsLatinRanges;
+    s_settingsLatinRanges.clear();
+    settingsLatinBuilder.BuildRanges(&s_settingsLatinRanges);
+
+    g_SettingsFont = io.Fonts->AddFontFromFileTTF(
+        "C:\\Windows\\Fonts\\SegUIVar.ttf", fontSize, nullptr,
+        s_settingsLatinRanges.Data);
+    if (!g_SettingsFont) {
+        g_SettingsFont = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeui.ttf", fontSize, nullptr,
+            s_settingsLatinRanges.Data);
+    }
+    if (g_SettingsFont) {
+        ImFontConfig mergeConfig;
+        mergeConfig.MergeMode = true;
+        mergeConfig.PixelSnapH = false;
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", fontSize,
+                                     &mergeConfig, s_imguiGlyphRanges.Data);
     }
 }
 
@@ -7572,6 +7618,7 @@ void SwitchToConfig()
     g_hwnd = CreateWindowEx(0, "FPSOverlay", "FPS Overlay",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME,
         cx, cy, cfgW, ch, nullptr, nullptr, g_hInstance, nullptr);
+    ApplyConfigWindowChrome(g_hwnd);
 
     if (!g_hwnd || !InitBackends()) {
         LogLine("SwitchToConfig failed; returning to overlay recovery");
@@ -7937,7 +7984,7 @@ static const char* SettingsPageDescription(int page)
     case SETTINGS_CONTROL:  return "配置快捷键、Windows 自启动和程序启动行为";
     case SETTINGS_HARDWARE: return "查看传感器状态、选择 GPU 并导出诊断信息";
     case SETTINGS_FEATURES: return "配置温度、低帧率、自动显示和整机功耗功能";
-    case SETTINGS_GAME_REPORT: return "最近一次游戏性能记录";
+    case SETTINGS_GAME_REPORT: return "浏览本地游戏记录、统计摘要和完整性能曲线";
     default:                return "实时状态、常用开关和硬件概览";
     }
 }
@@ -7963,7 +8010,7 @@ static bool DrawSettingsNavItem(const char* label, const char* hint, int page)
         ImGui::GetIO().DisplaySize.x < 820.0f * g_dpiScale;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const float width = ImGui::GetContentRegionAvail().x;
-    const float height = (compact ? 43.0f : 52.0f) * g_dpiScale;
+    const float height = (compact ? 42.0f : 48.0f) * g_dpiScale;
     const bool pressed = ImGui::InvisibleButton("##nav", ImVec2(width, height));
     const bool hovered = ImGui::IsItemHovered();
     const bool selected = g_settingsPage == page;
@@ -7972,46 +8019,39 @@ static bool DrawSettingsNavItem(const char* label, const char* hint, int page)
     if (selected || hovered) {
         dl->AddRectFilled(
             pos, ImVec2(pos.x + width, pos.y + height),
-            selected ? IM_COL32(29, 52, 91, 245) : IM_COL32(23, 34, 61, 220),
-            8.0f * g_dpiScale);
+            selected ? IM_COL32(28, 46, 70, 245) : IM_COL32(28, 34, 44, 235),
+            6.0f * g_dpiScale);
     }
     if (selected) {
         dl->AddRectFilled(
             pos, ImVec2(pos.x + 3.0f * g_dpiScale, pos.y + height),
-            IM_COL32(77, 164, 255, 255), 3.0f * g_dpiScale);
-        dl->AddRectFilled(
-            ImVec2(pos.x, pos.y + height * 0.60f),
-            ImVec2(pos.x + 3.0f * g_dpiScale, pos.y + height),
-            IM_COL32(133, 102, 255, 255), 3.0f * g_dpiScale);
-        dl->AddRect(
-            pos, ImVec2(pos.x + width, pos.y + height),
-            IM_COL32(75, 119, 184, 115), 8.0f * g_dpiScale);
+            IM_COL32(74, 160, 250, 255), 2.0f * g_dpiScale);
     }
 
     const ImVec2 codeMin(pos.x + 9.0f * g_dpiScale,
-                         pos.y + (compact ? 10.0f : 10.0f) * g_dpiScale);
-    const ImVec2 codeMax(codeMin.x + (compact ? 22.0f : 25.0f) * g_dpiScale,
-                         codeMin.y + (compact ? 22.0f : 25.0f) * g_dpiScale);
+                         pos.y + 10.0f * g_dpiScale);
+    const ImVec2 codeMax(codeMin.x + 22.0f * g_dpiScale,
+                         codeMin.y + 22.0f * g_dpiScale);
     dl->AddRectFilled(codeMin, codeMax,
                       selected ? IM_COL32(61, 126, 224, 185)
                                : IM_COL32(39, 51, 78, 225),
-                      6.0f * g_dpiScale);
+                       4.0f * g_dpiScale);
     dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.72f,
-                ImVec2(codeMin.x + 5.0f * g_dpiScale,
-                       codeMin.y + 5.0f * g_dpiScale),
+                 ImVec2(codeMin.x + 4.5f * g_dpiScale,
+                        codeMin.y + 4.0f * g_dpiScale),
                 selected ? IM_COL32(235, 245, 255, 255)
                          : IM_COL32(137, 151, 178, 255),
                 SettingsPageCode(page));
     dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-                ImVec2(pos.x + (compact ? 39.0f : 44.0f) * g_dpiScale,
-                       pos.y + (compact ? 11.0f : 7.0f) * g_dpiScale),
+                 ImVec2(pos.x + (compact ? 39.0f : 42.0f) * g_dpiScale,
+                        pos.y + (compact ? 10.5f : 5.0f) * g_dpiScale),
                 selected ? IM_COL32(235, 244, 255, 255)
                          : IM_COL32(190, 201, 222, 255),
                 label);
     if (!compact) {
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.76f,
-                    ImVec2(pos.x + 44.0f * g_dpiScale,
-                           pos.y + 29.0f * g_dpiScale),
+                     ImVec2(pos.x + 42.0f * g_dpiScale,
+                            pos.y + 26.0f * g_dpiScale),
                     selected ? IM_COL32(129, 158, 199, 255)
                              : IM_COL32(104, 119, 146, 255),
                     hint);
@@ -8071,7 +8111,7 @@ static void DrawSettingsStatusRail()
     if (ImGui::BeginTable("##status_rail", columns,
                           ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_overlay", "OVERLAY",
+        SettingsUi::MetricTile("##rail_overlay", "覆盖层",
                                overlayActive ? "运行中" :
                                (g_Mode == MODE_CONFIG ? "待启动" : "已隐藏"),
                                "实时状态",
@@ -8079,7 +8119,7 @@ static void DrawSettingsStatusRail()
                                              : SettingsUi::Warning());
 
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_sensors", "SENSORS",
+        SettingsUi::MetricTile("##rail_sensors", "传感器",
                                sensorState, sensorHint,
                                sensorsReady && !sensorsStale &&
                                        (recoveryStatus == PowerRecoveryStatus::Idle ||
@@ -8088,14 +8128,14 @@ static void DrawSettingsStatusRail()
                                    : SettingsUi::Warning());
 
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_power", "SYSTEM POWER",
+        SettingsUi::MetricTile("##rail_power", "整机功耗",
                                powerValue,
                                powerReady ? "自动融合" : "暂无来源",
                                powerReady ? SettingsUi::Accent()
                                           : SettingsUi::Warning());
 
         ImGui::TableNextColumn();
-        SettingsUi::MetricTile("##rail_layout", "LAYOUT",
+        SettingsUi::MetricTile("##rail_layout", "当前布局",
                                CurrentLayoutName(),
                                "当前配置",
                                SettingsUi::Violet());
@@ -8573,8 +8613,8 @@ static void DrawSettingsSidebar(bool liveSettings)
 {
     const bool compact =
         ImGui::GetIO().DisplaySize.x < 820.0f * g_dpiScale;
-    const float sidebarWidth = (compact ? 145.0f : 190.0f) * g_dpiScale;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.025f, 0.031f, 0.062f, 1.0f));
+    const float sidebarWidth = (compact ? 150.0f : 204.0f) * g_dpiScale;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.024f, 0.029f, 0.038f, 1.0f));
     ImGui::BeginChild("##settings_sidebar", ImVec2(sidebarWidth, 0.0f),
                       ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -8586,11 +8626,11 @@ static void DrawSettingsSidebar(bool liveSettings)
     sidebarDraw->AddRectFilled(
         brandScreen,
         ImVec2(brandScreen.x + badgeSize, brandScreen.y + badgeSize),
-        IM_COL32(47, 104, 210, 255), 9.0f * g_dpiScale);
+        IM_COL32(45, 103, 202, 255), 6.0f * g_dpiScale);
     sidebarDraw->AddRectFilled(
         ImVec2(brandScreen.x + badgeSize * 0.52f, brandScreen.y),
         ImVec2(brandScreen.x + badgeSize, brandScreen.y + badgeSize),
-        IM_COL32(102, 78, 222, 205), 9.0f * g_dpiScale,
+        IM_COL32(106, 83, 217, 190), 6.0f * g_dpiScale,
         ImDrawFlags_RoundCornersRight);
     sidebarDraw->AddText(
         ImGui::GetFont(), ImGui::GetFontSize() * 0.72f,
@@ -8605,7 +8645,7 @@ static void DrawSettingsSidebar(bool liveSettings)
     ImGui::SetWindowFontScale(1.0f);
     ImGui::SetCursorPosX(brandX + (compact ? 39.0f : 44.0f) * g_dpiScale);
     ImGui::TextColored(SettingsUi::MutedColor(),
-                       compact ? "CONTROL" : "PERFORMANCE LAB");
+                       compact ? "CONTROL" : "MONITOR CONTROL");
     ImGui::SetCursorPosY(brandY + (compact ? 38.0f : 43.0f) * g_dpiScale);
     ImGui::TextColored(SettingsUi::MutedColor(), "%s",
                        compact ? VER_SHORT_STRING : APP_VERSION);
@@ -8635,7 +8675,7 @@ static void DrawSettingsSidebar(bool liveSettings)
     DrawSettingsNavItem("控制与启动", "快捷键和自启动", SETTINGS_CONTROL);
     DrawSettingsNavItem("硬件信息", "传感器与诊断", SETTINGS_HARDWARE);
     DrawSettingsNavItem("提醒与功耗", "告警和整机模型", SETTINGS_FEATURES);
-    DrawSettingsNavItem("游戏报告", "最近一次游戏性能记录", SETTINGS_GAME_REPORT);
+    DrawSettingsNavItem("游戏报告", "历史记录与性能曲线", SETTINGS_GAME_REPORT);
 
     const float footerHeight = 110.0f * g_dpiScale;
     if (ImGui::GetContentRegionAvail().y > footerHeight)
@@ -8661,30 +8701,45 @@ static void DrawSettingsSidebar(bool liveSettings)
 
 static void DrawSettingsDashboard(bool liveSettings, bool& changed)
 {
+    if (g_SettingsFont)
+        ImGui::PushFont(g_SettingsFont);
     DrawSettingsSidebar(liveSettings);
     ImGui::SameLine(0.0f, 0.0f);
     ImGui::BeginChild("##settings_content", ImVec2(0.0f, 0.0f),
                       ImGuiChildFlags_AlwaysUseWindowPadding);
-    ImGui::TextColored(SettingsUi::Violet(), "SYSTEM / %s",
-                       SettingsPageCode(g_settingsPage));
-    ImGui::SetWindowFontScale(1.42f);
-    ImGui::TextColored(ImVec4(0.92f, 0.95f, 1.0f, 1.0f), "%s",
-                       SettingsPageTitle(g_settingsPage));
+    const ImVec2 codePos = ImGui::GetCursorScreenPos();
+    const ImVec2 codeSize(34.0f * g_dpiScale, 26.0f * g_dpiScale);
+    const ImVec2 codeMax(codePos.x + codeSize.x, codePos.y + codeSize.y);
+    ImGui::Dummy(codeSize);
+    ImDrawList* contentDraw = ImGui::GetWindowDrawList();
+    contentDraw->AddRectFilled(codePos, codeMax,
+                               IM_COL32(27, 48, 75, 255), 4.0f * g_dpiScale);
+    contentDraw->AddRect(codePos, codeMax,
+                         IM_COL32(69, 139, 226, 170), 4.0f * g_dpiScale);
+    contentDraw->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.78f,
+                         ImVec2(codePos.x + 8.0f * g_dpiScale,
+                                codePos.y + 5.0f * g_dpiScale),
+                         IM_COL32(177, 215, 255, 255), SettingsPageCode(g_settingsPage));
+    ImGui::SameLine(0.0f, 10.0f * g_dpiScale);
+    ImGui::SetWindowFontScale(1.34f);
+    ImGui::TextColored(SettingsUi::TextColor(), "%s", SettingsPageTitle(g_settingsPage));
     ImGui::SetWindowFontScale(1.0f);
     SettingsUi::MutedWrapped("%s", SettingsPageDescription(g_settingsPage));
     ImGui::Spacing();
     const ImVec2 railStart = ImGui::GetCursorScreenPos();
     const float railWidth = ImGui::GetContentRegionAvail().x;
-    ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
-        railStart, ImVec2(railStart.x + railWidth, railStart.y + 2.0f * g_dpiScale),
-        IM_COL32(77, 164, 255, 230),
-        IM_COL32(133, 102, 255, 175),
-        IM_COL32(133, 102, 255, 15),
-        IM_COL32(77, 164, 255, 15));
-    ImGui::Dummy(ImVec2(railWidth, 2.0f * g_dpiScale));
+    contentDraw->AddLine(railStart, ImVec2(railStart.x + railWidth, railStart.y),
+                         IM_COL32(48, 58, 73, 230), 1.0f * g_dpiScale);
+    contentDraw->AddLine(
+        railStart,
+        ImVec2(railStart.x + (std::min)(railWidth, 56.0f * g_dpiScale), railStart.y),
+        IM_COL32(74, 160, 250, 255), 2.0f * g_dpiScale);
+    ImGui::Dummy(ImVec2(railWidth, 1.0f * g_dpiScale));
     ImGui::Spacing();
     DrawSettingsPageContent(changed);
     ImGui::EndChild();
+    if (g_SettingsFont)
+        ImGui::PopFont();
 }
 
 static void DrawLiveSettingsPanel()
@@ -8823,6 +8878,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME,
         cx, cy, cfgW, ch, nullptr, nullptr, hInst, nullptr);
     if (!g_hwnd) return 1;
+    ApplyConfigWindowChrome(g_hwnd);
     RefreshDpiScale(g_hwnd);
 
     // ── Check admin privileges (app should always run as admin via manifest) ──

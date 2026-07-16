@@ -1081,13 +1081,18 @@ void DrawSummaryTile(const char* id, const char* label, const std::string& value
                      const char* secondaryLabel = nullptr,
                      const char* secondarySuffix = "")
 {
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 11.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.047f, 0.060f, 0.104f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.16f, 0.20f, 0.30f, 0.82f));
-    ImGui::BeginChild(id, ImVec2(0.0f, 88.0f),
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, SettingsUi::Surface2());
+    ImGui::PushStyleColor(ImGuiCol_Border, SettingsUi::Hairline());
+    ImGui::BeginChild(id, ImVec2(0.0f, 96.0f),
                       ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const ImVec2 tileStart = ImGui::GetWindowPos();
+    const ImVec2 tileSize = ImGui::GetWindowSize();
+    ImGui::GetWindowDrawList()->AddRectFilled(
+        tileStart, ImVec2(tileStart.x + 2.0f, tileStart.y + tileSize.y),
+        ImGui::ColorConvertFloat4ToU32(color), 1.0f);
     SettingsUi::Muted("%s", label);
     ImGui::TextColored(color, "%s", value.c_str());
     if (!detail.empty())
@@ -1147,8 +1152,8 @@ void DrawSessionPlot(const SessionData& session, MetricId metric)
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const ImVec2 boundsMin = origin;
     const ImVec2 boundsMax(origin.x + size.x, origin.y + size.y);
-    drawList->AddRectFilled(boundsMin, boundsMax, IM_COL32(11, 16, 31, 238), 6.0f);
-    drawList->AddRect(boundsMin, boundsMax, IM_COL32(55, 70, 104, 230), 6.0f);
+    drawList->AddRectFilled(boundsMin, boundsMax, IM_COL32(16, 20, 27, 245), 6.0f);
+    drawList->AddRect(boundsMin, boundsMax, IM_COL32(48, 58, 73, 230), 6.0f);
 
     constexpr float leftPadding = 48.0f;
     constexpr float rightPadding = 12.0f;
@@ -1185,7 +1190,7 @@ void DrawSessionPlot(const SessionData& session, MetricId metric)
         const float fraction = static_cast<float>(line) / 4.0f;
         const float y = plotTop + fraction * plotHeight;
         drawList->AddLine(ImVec2(plotLeft, y), ImVec2(plotRight, y),
-                          IM_COL32(60, 75, 108, 95), 1.0f);
+                          IM_COL32(63, 73, 88, 105), 1.0f);
         const double value = yMax - static_cast<double>(fraction) * (yMax - yMin);
         char label[32] = {};
         snprintf(label, sizeof(label), "%.0f", value);
@@ -2091,18 +2096,28 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
 {
     bool changed = false;
     if (SettingsUi::BeginCard("##game_report_options", "报告设置",
-                              "采样与保存")) {
+                               "本地记录策略")) {
         bool featureEnabled = impl_->enabled;
-        if (ImGui::Checkbox("启用游戏会话报告##report_page", &featureEnabled)) {
-            setEnabled(featureEnabled);
-            changed = true;
+        const int optionColumns = ImGui::GetContentRegionAvail().x > 720.0f ? 3 : 1;
+        if (ImGui::BeginTable("##game_report_options_grid", optionColumns,
+                              ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("启用会话报告##report_page", &featureEnabled)) {
+                setEnabled(featureEnabled);
+                changed = true;
+            }
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(!impl_->enabled);
+            if (ImGui::Checkbox("结束后自动打开##report_page", &impl_->autoOpen))
+                changed = true;
+            ImGui::EndDisabled();
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(!impl_->enabled);
+            if (ImGui::Checkbox("自动保存 CSV##report_page", &impl_->saveCsv))
+                changed = true;
+            ImGui::EndDisabled();
+            ImGui::EndTable();
         }
-        ImGui::BeginDisabled(!impl_->enabled);
-        if (ImGui::Checkbox("游戏结束后自动打开##report_page", &impl_->autoOpen))
-            changed = true;
-        if (ImGui::Checkbox("自动保存 CSV##report_page", &impl_->saveCsv))
-            changed = true;
-        ImGui::EndDisabled();
         if (impl_->activeSession)
             SettingsUi::Status("记录状态：", "游戏会话进行中", true);
         else
@@ -2124,8 +2139,11 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
         historyBusy = impl_->historyBusy;
     }
 
+    char historySubtitle[64] = {};
+    snprintf(historySubtitle, sizeof(historySubtitle), "最近 100 份本地 CSV · 已找到 %zu 份",
+             historyEntries.size());
     if (SettingsUi::BeginCard("##game_report_history", "历史记录",
-                              "最近 100 份本地 CSV")) {
+                               historySubtitle)) {
         ImGui::BeginDisabled(historyBusy);
         if (ImGui::Button("刷新记录"))
             impl_->QueueHistoryRefresh();
@@ -2156,7 +2174,7 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
                        ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_SizingStretchProp |
                            ImGuiTableFlags_ScrollY,
-                       ImVec2(0.0f, 230.0f))) {
+                       ImVec2(0.0f, 174.0f))) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableSetupColumn("游戏", ImGuiTableColumnFlags_WidthStretch, 2.2f);
             ImGui::TableSetupColumn("开始时间", ImGuiTableColumnFlags_WidthStretch, 1.7f);
@@ -2170,6 +2188,10 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
                                       historyReport != nullptr;
                 ImGui::PushID(pathId.c_str());
                 ImGui::TableNextRow();
+                if (selected) {
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           IM_COL32(31, 61, 94, 205));
+                }
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(entry.gameName.c_str());
                 SettingsUi::Muted("%s", entry.processName.c_str());
@@ -2204,32 +2226,57 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
     }
 
     if (SettingsUi::BeginCard("##game_report_summary", report->gameName.c_str(),
-                              report->processName.c_str())) {
-        ImGui::Text("开始  %s", FormatLocalTime(report->startLocal).c_str());
-        ImGui::Text("结束  %s", FormatLocalTime(report->endLocal).c_str());
-        ImGui::Text("时长  %s", FormatDuration(report->durationSeconds).c_str());
-        ImGui::Spacing();
+                               report->processName.c_str())) {
         const char* energyLabel = report->energyIncludesEstimate ? "估算用电量" : "实际用电量";
-        if (Stats(*report, MetricId::SystemPower).validSamples > 0) {
-            ImGui::TextColored(report->energyIncludesEstimate ? SettingsUi::Warning() : SettingsUi::Success(),
-                               "%s  %.6f kWh", energyLabel, report->energyWh / 1000.0);
-            ImGui::SameLine();
-            SettingsUi::Muted("功耗覆盖率 %.1f%%", report->powerCoveragePercent);
-        } else {
-            ImGui::Text("%s  N/A", energyLabel);
-            ImGui::SameLine();
-            SettingsUi::Muted("功耗覆盖率 0%%");
+        const int summaryColumns = ImGui::GetContentRegionAvail().x > 620.0f ? 2 : 1;
+        if (ImGui::BeginTable("##game_report_session_summary", summaryColumns,
+                              ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            SettingsUi::Muted("会话时间");
+            ImGui::Text("开始  %s", FormatLocalTime(report->startLocal).c_str());
+            ImGui::Text("结束  %s", FormatLocalTime(report->endLocal).c_str());
+            ImGui::TextColored(SettingsUi::Accent(), "时长  %s",
+                               FormatDuration(report->durationSeconds).c_str());
+
+            ImGui::TableNextColumn();
+            SettingsUi::Muted("能耗记录");
+            if (Stats(*report, MetricId::SystemPower).validSamples > 0) {
+                ImGui::TextColored(
+                    report->energyIncludesEstimate ? SettingsUi::Warning() : SettingsUi::Success(),
+                    "%s  %.6f kWh", energyLabel, report->energyWh / 1000.0);
+                ImGui::Text("功耗覆盖率  %.1f%%", report->powerCoveragePercent);
+                ImGui::ProgressBar(
+                    std::clamp(static_cast<float>(report->powerCoveragePercent / 100.0),
+                               0.0f, 1.0f),
+                    ImVec2(-1.0f, 6.0f), "");
+            } else {
+                ImGui::Text("%s  N/A", energyLabel);
+                SettingsUi::Muted("功耗覆盖率 0%%");
+            }
+            ImGui::EndTable();
         }
         if (report->powerCoveragePercent < 80.0) {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextColored(SettingsUi::Warning(),
                                "功耗数据覆盖率偏低，用电量只代表有有效功耗样本的时间段。");
+            ImGui::PopTextWrapPos();
         }
         if (report->sampleLimitReached) {
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextColored(SettingsUi::Warning(),
                                "本局超过 8 小时样本上限，曲线只保留前 28,800 个逐秒样本。");
+            ImGui::PopTextWrapPos();
         }
         const std::string csvPath = WideToUtf8(report->csvPath.wstring());
-        SettingsUi::MutedWrapped("保存路径：%s", csvPath.c_str());
+        const std::string csvFileName = WideToUtf8(report->csvPath.filename().wstring());
+        SettingsUi::Muted("记录文件");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(csvFileName.empty() ? "尚未保存" : csvFileName.c_str());
+        if (!csvPath.empty() && ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextWrapped("%s", csvPath.c_str());
+            ImGui::EndTooltip();
+        }
         if (ImGui::Button("打开记录文件夹")) {
             const std::filesystem::path folder = report->csvPath.parent_path();
             ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -2249,7 +2296,11 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
     const MetricStatistics& gpuTemperature = Stats(*report, MetricId::GpuTemperature);
     const MetricStatistics& ramUsage = Stats(*report, MetricId::RamUsagePercent);
     const MetricStatistics& systemPower = Stats(*report, MetricId::SystemPower);
-    if (ImGui::BeginTable("##game_report_tiles", 3,
+    const float tileAreaWidth = ImGui::GetContentRegionAvail().x;
+    const int tileColumns = tileAreaWidth > 820.0f ? 5 :
+                            (tileAreaWidth > 520.0f ? 3 :
+                             (tileAreaWidth > 320.0f ? 2 : 1));
+    if (ImGui::BeginTable("##game_report_tiles", tileColumns,
                           ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextColumn();
         const std::string fpsDetail = report->hasOnePercentLowFps
@@ -2282,30 +2333,8 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
         ImGui::EndTable();
     }
 
-    if (SettingsUi::BeginCard("##game_report_hardware", "本局硬件环境")) {
-        if (ImGui::BeginTable("##game_report_hardware_table", 2,
-                              ImGuiTableFlags_BordersInnerH |
-                              ImGuiTableFlags_SizingStretchProp)) {
-            auto row = [](const char* label, const std::string& value) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                SettingsUi::Muted("%s", label);
-                ImGui::TableNextColumn();
-                ImGui::TextWrapped("%s", value.empty() ? "N/A" : value.c_str());
-            };
-            row("Windows", report->hardware.windowsVersion);
-            row("CPU", report->hardware.cpuName);
-            row("GPU", report->hardware.gpuName);
-            row("总内存", NumberOrNa(report->hardware.totalMemoryGb > 0.0,
-                                      report->hardware.totalMemoryGb, 2) + " GB");
-            row("显示器", report->hardware.displayMode);
-            ImGui::EndTable();
-        }
-    }
-    SettingsUi::EndCard();
-
     if (SettingsUi::BeginCard("##game_report_curve", "完整会话曲线",
-                              "平均 / 最低 / 最高参考线")) {
+                               "平均 / 最低 / 最高参考线")) {
         static constexpr MetricId plotMetrics[] = {
             MetricId::Fps, MetricId::CpuUsage, MetricId::CpuTemperature,
             MetricId::CpuPower, MetricId::GpuUsage, MetricId::GpuTemperature,
@@ -2325,6 +2354,29 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
             ImGui::EndCombo();
         }
         DrawSessionPlot(*report, plotMetrics[impl_->selectedPlotMetric]);
+    }
+    SettingsUi::EndCard();
+
+    if (SettingsUi::BeginCard("##game_report_hardware", "本局硬件环境",
+                               "报告生成时的设备快照")) {
+        if (ImGui::BeginTable("##game_report_hardware_table", 2,
+                              ImGuiTableFlags_BordersInnerH |
+                              ImGuiTableFlags_SizingStretchProp)) {
+            auto row = [](const char* label, const std::string& value) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                SettingsUi::Muted("%s", label);
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", value.empty() ? "N/A" : value.c_str());
+            };
+            row("Windows", report->hardware.windowsVersion);
+            row("CPU", report->hardware.cpuName);
+            row("GPU", report->hardware.gpuName);
+            row("总内存", NumberOrNa(report->hardware.totalMemoryGb > 0.0,
+                                      report->hardware.totalMemoryGb, 2) + " GB");
+            row("显示器", report->hardware.displayMode);
+            ImGui::EndTable();
+        }
     }
     SettingsUi::EndCard();
     return changed;
