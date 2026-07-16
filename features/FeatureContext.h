@@ -51,6 +51,7 @@ struct FeatureContext {
     char cpuName[256] = "";
     char gpuName[256] = "";
     DWORD gameProcessId = 0;
+    bool gameProcessExcludedFromSession = false;
     bool isInGame = false;
     bool isOnAcPower = true;
     bool acOnline = true;

@@ -58,6 +58,7 @@ public:
     bool DrawReportPage(FeatureContext& context);
     bool ConsumeOpenRequest();
     bool HasCompletedSession() const;
+    bool NeedsSensorPolling() const;
 
 private:
     struct Impl;

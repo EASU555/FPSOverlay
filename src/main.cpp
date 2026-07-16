@@ -2381,6 +2381,16 @@ static std::string LowerAscii(const char* value)
     return result;
 }
 
+static bool ExecutableNameEquals(const char* value, const char* expected)
+{
+    if (!value || !expected)
+        return false;
+    const size_t expectedLength = strlen(expected);
+    return _strnicmp(value, expected, expectedLength) == 0 &&
+           (value[expectedLength] == '\0' ||
+            (value[expectedLength] == ' ' && value[expectedLength + 1] == '('));
+}
+
 static bool IsIgnoredForegroundProcess(const char* exeName)
 {
     if (!exeName || !exeName[0]) return true;
@@ -2391,7 +2401,7 @@ static bool IsIgnoredForegroundProcess(const char* exeName)
         "lockapp.exe", "winlogon.exe", "csrss.exe", "fontdrvhost.exe"
     };
     for (const char* name : ignored) {
-        if (_stricmp(exeName, name) == 0)
+        if (ExecutableNameEquals(exeName, name))
             return true;
     }
     return false;
@@ -2418,7 +2428,7 @@ static bool IsKnownDesktopProcess(const char* exeName)
         "wallpaper64.exe", "wallpaper32.exe", "wallpaperservice32.exe"
     };
     for (const char* name : desktopApps) {
-        if (_stricmp(exeName, name) == 0)
+        if (ExecutableNameEquals(exeName, name))
             return true;
     }
     return false;
@@ -6342,6 +6352,11 @@ static void UpdateFeatureContext(float fps, float cpuUsage, float ramUsed, float
     snprintf(ctx.gameProcessName, sizeof(ctx.gameProcessName), "%s", g_targetProcessName);
     snprintf(ctx.cpuName, sizeof(ctx.cpuName), "%s", g_cpuName);
     ctx.gameProcessId = g_targetPid.load(std::memory_order_relaxed);
+    ctx.gameProcessExcludedFromSession =
+        ctx.gameProcessId == GetCurrentProcessId() ||
+        (g_targetProcessName[0] &&
+         (IsIgnoredForegroundProcess(g_targetProcessName) ||
+          IsKnownDesktopProcess(g_targetProcessName)));
     ctx.isInGame = g_ForegroundGameConfirmed;
 
     SYSTEM_POWER_STATUS power = {};
@@ -9676,6 +9691,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             if (!g_isDragging) {
                 const bool powerComparisonRecording =
                     g_FeatureRegistry.IsPowerComparisonRecording();
+                const bool gameReportNeedsSensorPolling =
+                    g_FeatureRegistry.GameSessionReportNeedsSensorPolling();
                 static bool wasPowerComparisonRecording = false;
                 if (powerComparisonRecording && !wasPowerComparisonRecording) {
                     lastCpuTime = now - std::chrono::seconds(10);
@@ -9691,7 +9708,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
                     : (float)g_Config.refreshMs / 1000.0f;
                 const bool pauseHeavySensors =
                     (g_ShowLiveSettings || g_listeningFor != 0) &&
-                    !powerComparisonRecording;
+                    !powerComparisonRecording && !gameReportNeedsSensorPolling;
                 float cpuElapsed = std::chrono::duration<float>(now - lastCpuTime).count();
                 if (cpuElapsed >= refreshSec) {
                     cpuUsage = GetCpuUsage();

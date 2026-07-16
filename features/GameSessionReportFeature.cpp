@@ -1080,7 +1080,10 @@ struct GameSessionReportFeature::Impl {
             sample.vramUsagePercentValid = true;
         }
 
-        sample.systemPowerValid = context.hasEstimatedSystemPower &&
+        const bool estimatedPowerInputsFresh =
+            !context.systemPowerEstimated || hardwareFresh;
+        sample.systemPowerValid = estimatedPowerInputsFresh &&
+                                  context.hasEstimatedSystemPower &&
                                   ValidPower(context.estimatedSystemPowerW);
         if (sample.systemPowerValid) {
             sample.systemPower = context.estimatedSystemPowerW;
@@ -1208,7 +1211,8 @@ struct GameSessionReportFeature::Impl {
     void Update(FeatureContext& context)
     {
         const ULONGLONG now = GetTickCount64();
-        const bool targetEligible = context.gameProcessId != 0 &&
+        const bool targetEligible = !context.gameProcessExcludedFromSession &&
+                                    context.gameProcessId != 0 &&
                                     (context.isInGame ||
                                      (IsFinite(context.fps) && context.fps > 0.0f));
         const bool longGap = lastUpdateTick != 0 && now - lastUpdateTick > kLongUpdateGapMs;
@@ -1243,7 +1247,9 @@ struct GameSessionReportFeature::Impl {
             if (targetEligible && context.gameProcessId != activeSession->processId) {
                 const ULONGLONG endTick = activeSession->lastTargetTick;
                 const SYSTEMTIME endLocal = activeSession->lastTargetLocal;
-                FinalizeActive(endTick, endLocal, true);
+                // A direct game-to-game switch must not replace the in-game overlay
+                // with the completed report page for the previous process.
+                FinalizeActive(endTick, endLocal, false);
                 StartCandidate(context, now);
                 return;
             }
@@ -1314,12 +1320,29 @@ struct GameSessionReportFeature::Impl {
         snprintf(context.foregroundWindowTitle, sizeof(context.foregroundWindowTitle),
                  "%s", "QA Game");
 
+        FeatureContext excludedContext = context;
+        excludedContext.gameProcessExcludedFromSession = true;
+        test.Update(excludedContext);
+        if (test.candidatePid != 0 || test.activeSession)
+            return false;
+
         test.Update(context);
         if (test.candidateSinceTick < kTargetStableMs)
             return false;
         test.candidateSinceTick -= kTargetStableMs;
         test.Update(context);
         if (!test.activeSession || test.activeSession->samples.empty())
+            return false;
+
+        FeatureContext stalePowerContext = context;
+        stalePowerContext.hasEstimatedSystemPower = true;
+        stalePowerContext.estimatedSystemPowerW = 100.0f;
+        stalePowerContext.systemPowerEstimated = true;
+        stalePowerContext.hardwareSensorDataStale = true;
+        if (test.MakeSample(stalePowerContext, GetTickCount64()).systemPowerValid)
+            return false;
+        stalePowerContext.systemPowerEstimated = false;
+        if (!test.MakeSample(stalePowerContext, GetTickCount64()).systemPowerValid)
             return false;
 
         FeatureContext missingContext = context;
@@ -1367,7 +1390,29 @@ struct GameSessionReportFeature::Impl {
         autoOpenTest.activeSession->samples.push_back(last);
         autoOpenTest.FinalizeActive(autoOpenTest.activeSession->startTick + 32000,
                                     CurrentLocalTime(), true);
-        return autoOpenTest.openRequested.load(std::memory_order_acquire);
+        if (!autoOpenTest.openRequested.load(std::memory_order_acquire))
+            return false;
+
+        Impl gameSwitchTest;
+        gameSwitchTest.saveCsv = false;
+        gameSwitchTest.autoOpen = true;
+        gameSwitchTest.activeSession = std::make_unique<SessionData>();
+        const ULONGLONG switchNow = GetTickCount64();
+        gameSwitchTest.activeSession->processId = GetCurrentProcessId();
+        gameSwitchTest.activeSession->processName = "qa-old-game.exe";
+        gameSwitchTest.activeSession->gameName = "QA Old Game";
+        gameSwitchTest.activeSession->startLocal = CurrentLocalTime();
+        gameSwitchTest.activeSession->startTick = switchNow - 32000;
+        gameSwitchTest.activeSession->lastTargetTick = switchNow;
+        gameSwitchTest.activeSession->lastTargetLocal = CurrentLocalTime();
+        gameSwitchTest.activeSession->samples.push_back(first);
+        gameSwitchTest.activeSession->samples.push_back(last);
+        FeatureContext nextGame = context;
+        nextGame.gameProcessId += 1;
+        gameSwitchTest.Update(nextGame);
+        return gameSwitchTest.lastCompletedSession &&
+               gameSwitchTest.candidatePid == nextGame.gameProcessId &&
+               !gameSwitchTest.openRequested.load(std::memory_order_acquire);
     }
 
     bool RunPersistenceSelfTest()
@@ -1676,6 +1721,12 @@ bool GameSessionReportFeature::ConsumeOpenRequest()
 bool GameSessionReportFeature::HasCompletedSession() const
 {
     return impl_->lastCompletedSession != nullptr;
+}
+
+bool GameSessionReportFeature::NeedsSensorPolling() const
+{
+    return impl_->enabled &&
+           (impl_->candidatePid != 0 || impl_->activeSession != nullptr);
 }
 
 void GameSessionReportFeature::Shutdown()

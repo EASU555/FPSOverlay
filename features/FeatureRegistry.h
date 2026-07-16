@@ -65,6 +65,7 @@ public:
     bool DrawGameSessionReportPage(FeatureContext& context);
     bool ConsumeGameSessionReportOpenRequest();
     bool HasCompletedGameSession() const;
+    bool GameSessionReportNeedsSensorPolling() const;
     bool ToggleLaptopPowerQuickOption(LaptopPowerQuickOption option);
     bool IsPowerComparisonRecording() const;
     void Shutdown();

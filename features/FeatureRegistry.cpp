@@ -364,6 +364,15 @@ bool FeatureRegistry::HasCompletedGameSession() const
     return false;
 }
 
+bool FeatureRegistry::GameSessionReportNeedsSensorPolling() const
+{
+    for (const auto& feature : features_) {
+        if (auto* report = AsGameSessionReport(feature.get()))
+            return report->NeedsSensorPolling();
+    }
+    return false;
+}
+
 bool FeatureRegistry::ToggleLaptopPowerQuickOption(LaptopPowerQuickOption option)
 {
     for (auto& feature : features_) {
