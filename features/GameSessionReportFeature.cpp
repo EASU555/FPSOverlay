@@ -1085,7 +1085,7 @@ void DrawSummaryTile(const char* id, const char* label, const std::string& value
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, SettingsUi::Surface2());
     ImGui::PushStyleColor(ImGuiCol_Border, SettingsUi::Hairline());
-    ImGui::BeginChild(id, ImVec2(0.0f, 96.0f),
+    ImGui::BeginChild(id, ImVec2(0.0f, 88.0f),
                       ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     const ImVec2 tileStart = ImGui::GetWindowPos();
@@ -1094,9 +1094,15 @@ void DrawSummaryTile(const char* id, const char* label, const std::string& value
         tileStart, ImVec2(tileStart.x + 2.0f, tileStart.y + tileSize.y),
         ImGui::ColorConvertFloat4ToU32(color), 1.0f);
     SettingsUi::Muted("%s", label);
+    const float valueLineWidth = ImGui::GetContentRegionAvail().x;
+    const float combinedWidth = ImGui::CalcTextSize(value.c_str()).x +
+                                ImGui::CalcTextSize(detail.c_str()).x + 8.0f;
     ImGui::TextColored(color, "%s", value.c_str());
-    if (!detail.empty())
+    if (!detail.empty()) {
+        if (combinedWidth <= valueLineWidth)
+            ImGui::SameLine(0.0f, 8.0f);
         SettingsUi::Muted("%s", detail.c_str());
+    }
     ImGui::EndChild();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(2);
@@ -2190,10 +2196,20 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
                 ImGui::TableNextRow();
                 if (selected) {
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                                           IM_COL32(31, 61, 94, 205));
+                                           IM_COL32(23, 30, 40, 245));
                 }
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(entry.gameName.c_str());
+                if (selected) {
+                    const ImVec2 marker = ImGui::GetCursorScreenPos();
+                    ImGui::GetWindowDrawList()->AddRectFilled(
+                        ImVec2(marker.x - 8.0f, marker.y - 4.0f),
+                        ImVec2(marker.x - 5.0f,
+                               marker.y + ImGui::GetTextLineHeight() * 2.0f + 7.0f),
+                        ImGui::ColorConvertFloat4ToU32(SettingsUi::Accent()), 1.0f);
+                    ImGui::TextColored(SettingsUi::TextColor(), "%s", entry.gameName.c_str());
+                } else {
+                    ImGui::TextUnformatted(entry.gameName.c_str());
+                }
                 SettingsUi::Muted("%s", entry.processName.c_str());
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(entry.startTime.c_str());
@@ -2202,10 +2218,14 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(entry.averageFps.c_str());
                 ImGui::TableNextColumn();
-                ImGui::BeginDisabled(selected || historyBusy);
-                if (ImGui::Button(selected ? "查看中" : "查看"))
-                    impl_->QueueHistoryLoad(entry.path);
-                ImGui::EndDisabled();
+                if (selected) {
+                    ImGui::TextColored(SettingsUi::Accent(), "当前");
+                } else {
+                    ImGui::BeginDisabled(historyBusy);
+                    if (ImGui::Button("查看"))
+                        impl_->QueueHistoryLoad(entry.path);
+                    ImGui::EndDisabled();
+                }
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -2227,32 +2247,59 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
 
     if (SettingsUi::BeginCard("##game_report_summary", report->gameName.c_str(),
                                report->processName.c_str())) {
-        const char* energyLabel = report->energyIncludesEstimate ? "估算用电量" : "实际用电量";
-        const int summaryColumns = ImGui::GetContentRegionAvail().x > 620.0f ? 2 : 1;
+        const char* powerSourceLabel = report->energyIncludesEstimate
+            ? "软件融合估算" : "真实整机传感器";
+        const bool wideSummary = ImGui::GetContentRegionAvail().x > 720.0f;
+        const int summaryColumns = wideSummary ? 4 : 2;
+        const float shortLabelWidth = ImGui::CalcTextSize("覆盖率").x + 8.0f;
+        const float longLabelWidth = ImGui::CalcTextSize("数据来源").x + 8.0f;
         if (ImGui::BeginTable("##game_report_session_summary", summaryColumns,
-                              ImGuiTableFlags_SizingStretchSame)) {
+                              ImGuiTableFlags_SizingStretchProp)) {
+            if (wideSummary) {
+                ImGui::TableSetupColumn("##summary_label_1", ImGuiTableColumnFlags_WidthFixed,
+                                        shortLabelWidth);
+                ImGui::TableSetupColumn("##summary_value_1", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                ImGui::TableSetupColumn("##summary_label_2", ImGuiTableColumnFlags_WidthFixed,
+                                        longLabelWidth);
+                ImGui::TableSetupColumn("##summary_value_2", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            } else {
+                ImGui::TableSetupColumn("##summary_label", ImGuiTableColumnFlags_WidthFixed,
+                                        longLabelWidth);
+                ImGui::TableSetupColumn("##summary_value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            }
+            const auto label = [](const char* text) {
+                ImGui::TableNextColumn();
+                SettingsUi::Muted("%s", text);
+            };
+            label("开始");
             ImGui::TableNextColumn();
-            SettingsUi::Muted("会话时间");
-            ImGui::Text("开始  %s", FormatLocalTime(report->startLocal).c_str());
-            ImGui::Text("结束  %s", FormatLocalTime(report->endLocal).c_str());
-            ImGui::TextColored(SettingsUi::Accent(), "时长  %s",
+            ImGui::TextUnformatted(FormatLocalTime(report->startLocal).c_str());
+            label("结束");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(FormatLocalTime(report->endLocal).c_str());
+            label("时长");
+            ImGui::TableNextColumn();
+            ImGui::TextColored(SettingsUi::Accent(), "%s",
                                FormatDuration(report->durationSeconds).c_str());
-
+            label("用电量");
             ImGui::TableNextColumn();
-            SettingsUi::Muted("能耗记录");
             if (Stats(*report, MetricId::SystemPower).validSamples > 0) {
                 ImGui::TextColored(
                     report->energyIncludesEstimate ? SettingsUi::Warning() : SettingsUi::Success(),
-                    "%s  %.6f kWh", energyLabel, report->energyWh / 1000.0);
-                ImGui::Text("功耗覆盖率  %.1f%%", report->powerCoveragePercent);
-                ImGui::ProgressBar(
-                    std::clamp(static_cast<float>(report->powerCoveragePercent / 100.0),
-                               0.0f, 1.0f),
-                    ImVec2(-1.0f, 6.0f), "");
+                    "%.6f kWh", report->energyWh / 1000.0);
             } else {
-                ImGui::Text("%s  N/A", energyLabel);
-                SettingsUi::Muted("功耗覆盖率 0%%");
+                ImGui::TextUnformatted("N/A");
             }
+            label("覆盖率");
+            ImGui::TableNextColumn();
+            ImGui::TextColored(report->powerCoveragePercent >= 80.0
+                                   ? SettingsUi::Success() : SettingsUi::Warning(),
+                               "%.1f%%", report->powerCoveragePercent);
+            label("数据来源");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(
+                Stats(*report, MetricId::SystemPower).validSamples > 0
+                    ? powerSourceLabel : "N/A");
             ImGui::EndTable();
         }
         if (report->powerCoveragePercent < 80.0) {
@@ -2269,17 +2316,29 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
         }
         const std::string csvPath = WideToUtf8(report->csvPath.wstring());
         const std::string csvFileName = WideToUtf8(report->csvPath.filename().wstring());
-        SettingsUi::Muted("记录文件");
-        ImGui::SameLine();
-        ImGui::TextUnformatted(csvFileName.empty() ? "尚未保存" : csvFileName.c_str());
-        if (!csvPath.empty() && ImGui::IsItemHovered()) {
-            ImGui::BeginTooltip();
-            ImGui::TextWrapped("%s", csvPath.c_str());
-            ImGui::EndTooltip();
-        }
-        if (ImGui::Button("打开记录文件夹")) {
-            const std::filesystem::path folder = report->csvPath.parent_path();
-            ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ImGui::Separator();
+        const float openFolderWidth = ImGui::CalcTextSize("打开文件夹").x +
+                                      ImGui::GetStyle().FramePadding.x * 2.0f + 4.0f;
+        if (ImGui::BeginTable("##game_report_file_row", 2,
+                              ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("##report_file", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("##report_file_action", ImGuiTableColumnFlags_WidthFixed,
+                                    openFolderWidth);
+            ImGui::TableNextColumn();
+            SettingsUi::Muted("记录文件");
+            ImGui::SameLine();
+            ImGui::TextUnformatted(csvFileName.empty() ? "尚未保存" : csvFileName.c_str());
+            if (!csvPath.empty() && ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextWrapped("%s", csvPath.c_str());
+                ImGui::EndTooltip();
+            }
+            ImGui::TableNextColumn();
+            if (ImGui::Button("打开文件夹")) {
+                const std::filesystem::path folder = report->csvPath.parent_path();
+                ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            ImGui::EndTable();
         }
         std::lock_guard<std::mutex> statusLock(impl_->writerStatusMutex);
         if (!impl_->lastWriterError.empty()) {
@@ -2310,13 +2369,13 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
                         FormatMetricAverage(fps, "", 1), fpsDetail,
                         SettingsUi::Accent(), fps, " FPS");
         ImGui::TableNextColumn();
-        DrawSummaryTile("##report_cpu", "CPU",
+        DrawSummaryTile("##report_cpu", "CPU 平均占用",
                         FormatMetricAverage(cpuUsage, "%", 1),
                         "平均温度 " + FormatMetricAverage(cpuTemperature, "°C", 1),
                         SettingsUi::Success(), cpuUsage, "%",
                         &cpuTemperature, "CPU 温度", "°C");
         ImGui::TableNextColumn();
-        DrawSummaryTile("##report_gpu", "GPU",
+        DrawSummaryTile("##report_gpu", "GPU 平均占用",
                         FormatMetricAverage(gpuUsage, "%", 1),
                         "平均温度 " + FormatMetricAverage(gpuTemperature, "°C", 1),
                         SettingsUi::Violet(), gpuUsage, "%",
