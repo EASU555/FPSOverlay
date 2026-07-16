@@ -935,5 +935,5 @@
 - [x] `FPSOVERLAY_UI_QA` 以 `/W4 /permissive- /Zi` 无警告编译通过；运行 5 秒保持响应，自检通过并以代码 0 正常退出。
 - [x] Release x64 资源编译、C++ 编译、链接和 LTCG 以 `/W4 /permissive- /Zi` 无警告通过。
 - [x] Windows `FileVersion` 为 `1.10.40.0`，`ProductVersion` 为 `v1.10.40 (2026-07-16 17:58)`。
-- [x] 本次未启动 v1.10.40 正式程序；用户当前仍在运行 v1.10.39，因此待进程退出后替换发布目录根部 `overlay.exe`。
+- [x] 本次未启动 v1.10.40 正式程序；用户正常退出 v1.10.39 后，发布目录根部 `overlay.exe` 已替换并核对为 v1.10.40。
 - [ ] 用户复测启动带 GameGuard/EAC/BattlEye 的游戏，确认只记录真实游戏进程。
