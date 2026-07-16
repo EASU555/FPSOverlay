@@ -599,7 +599,7 @@ std::string BuildCsv(const SessionData& session)
            << session.validSampleDurationSeconds << "\r\n";
     output << "功耗数据覆盖率(%)," << std::fixed << std::setprecision(1)
            << session.powerCoveragePercent << "\r\n";
-    output << (session.energyIncludesEstimate ? "估算用电量(kWh)," : "实际用电量(kWh),")
+    output << (session.energyIncludesEstimate ? "估算用电量(度)," : "实际用电量(度),")
            << std::fixed << std::setprecision(6) << session.energyWh / 1000.0 << "\r\n";
     output << "样本上限保护," << (session.sampleLimitReached ? "已触发" : "未触发") << "\r\n\r\n";
 
@@ -1963,6 +1963,10 @@ struct GameSessionReportFeature::Impl {
         sample.fpsValid = true;
         session->samples.push_back(sample);
         CalculateSessionStatistics(*session);
+        const std::string csvText = BuildCsv(*session);
+        const bool energyUnitValid =
+            csvText.find("实际用电量(度),") != std::string::npos &&
+            csvText.find("用电量(kWh)") == std::string::npos;
         session->csvPath = ReportDirectory() /
             (L"QA_中文路径_" + std::to_wstring(GetCurrentProcessId()) + L".csv");
         test.QueueCsv(session);
@@ -1983,7 +1987,7 @@ struct GameSessionReportFeature::Impl {
             ReadHistoryEntry(session->csvPath, historyEntry, entryReadError);
         std::error_code removeError;
         std::filesystem::remove(session->csvPath, removeError);
-        return validBom && test.lastWriterError.empty() && loaded &&
+        return validBom && energyUnitValid && test.lastWriterError.empty() && loaded &&
                loaded->gameName == session->gameName &&
                loaded->processName == session->processName &&
                loaded->samples.size() == session->samples.size() &&
@@ -2352,7 +2356,7 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
             if (Stats(*report, MetricId::SystemPower).validSamples > 0) {
                 ImGui::TextColored(
                     report->energyIncludesEstimate ? SettingsUi::Warning() : SettingsUi::Success(),
-                    "%.6f kWh", report->energyWh / 1000.0);
+                    "%.6f 度", report->energyWh / 1000.0);
             } else {
                 ImGui::TextUnformatted("N/A");
             }

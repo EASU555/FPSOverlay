@@ -5,12 +5,12 @@
 // - Refresh VER_BUILD_DATE / VER_BUILD_TIME for every delivered Release build.
 #define VER_MAJOR 1
 #define VER_MINOR 10
-#define VER_PATCH 45
+#define VER_PATCH 46
 #define VER_BUILD 0
 
 #define VER_BUILD_DATE "2026-07-16"
-#define VER_BUILD_TIME "20:35"
-#define VER_BUILD_STAMP "20260716-2035"
+#define VER_BUILD_TIME "22:15"
+#define VER_BUILD_STAMP "20260716-2215"
 
 #define VER_STRINGIFY2(x) #x
 #define VER_STRINGIFY(x) VER_STRINGIFY2(x)
