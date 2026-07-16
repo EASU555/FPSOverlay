@@ -5,6 +5,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <cwchar>
 #include <deque>
 #include <exception>
@@ -34,6 +36,7 @@ constexpr ULONGLONG kLongUpdateGapMs = 10000;
 constexpr ULONGLONG kSampleIntervalMs = 1000;
 constexpr double kAutoOpenDurationSeconds = 30.0;
 constexpr size_t kMaxSamples = 8u * 60u * 60u;
+constexpr size_t kMaxHistoryEntries = 100;
 
 enum class MetricId {
     Fps,
@@ -96,6 +99,17 @@ struct SessionData {
 
 struct CsvJob {
     std::shared_ptr<const SessionData> session;
+};
+
+struct HistoryEntry {
+    std::filesystem::path path;
+    std::filesystem::file_time_type modifiedTime = {};
+    uintmax_t sizeBytes = 0;
+    std::string gameName;
+    std::string processName;
+    std::string startTime;
+    std::string duration;
+    std::string averageFps;
 };
 
 struct WindowTitleSearch {
@@ -707,6 +721,343 @@ bool WriteCsvSafely(const SessionData& session, std::string& error)
     return true;
 }
 
+void NormalizeCsvLine(std::string& line)
+{
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+    if (line.size() >= 3 &&
+        static_cast<unsigned char>(line[0]) == 0xEF &&
+        static_cast<unsigned char>(line[1]) == 0xBB &&
+        static_cast<unsigned char>(line[2]) == 0xBF) {
+        line.erase(0, 3);
+    }
+}
+
+std::vector<std::string> ParseCsvRow(const std::string& line)
+{
+    std::vector<std::string> fields;
+    std::string field;
+    bool quoted = false;
+    for (size_t index = 0; index < line.size(); ++index) {
+        const char character = line[index];
+        if (quoted) {
+            if (character == '"') {
+                if (index + 1 < line.size() && line[index + 1] == '"') {
+                    field.push_back('"');
+                    ++index;
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push_back(character);
+            }
+        } else if (character == '"') {
+            quoted = true;
+        } else if (character == ',') {
+            fields.push_back(std::move(field));
+            field.clear();
+        } else {
+            field.push_back(character);
+        }
+    }
+    fields.push_back(std::move(field));
+    return fields;
+}
+
+bool ParseNumber(const std::string& text, double& value)
+{
+    if (text.empty() || text == "N/A")
+        return false;
+    char* end = nullptr;
+    const double parsed = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || !std::isfinite(parsed))
+        return false;
+    while (*end == ' ' || *end == '\t')
+        ++end;
+    if (*end != '\0')
+        return false;
+    value = parsed;
+    return true;
+}
+
+bool ParseUnsignedNumber(const std::string& text, unsigned long& value)
+{
+    if (text.empty() || text == "N/A")
+        return false;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
+    if (end == text.c_str())
+        return false;
+    while (*end == ' ' || *end == '\t')
+        ++end;
+    if (*end != '\0')
+        return false;
+    value = parsed;
+    return true;
+}
+
+bool ParseLocalTimeText(const std::string& text, SYSTEMTIME& value)
+{
+    unsigned int year = 0;
+    unsigned int month = 0;
+    unsigned int day = 0;
+    unsigned int hour = 0;
+    unsigned int minute = 0;
+    unsigned int second = 0;
+    if (sscanf_s(text.c_str(), "%u-%u-%u %u:%u:%u",
+                 &year, &month, &day, &hour, &minute, &second) != 6 ||
+        year < 2000 || month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour > 23 || minute > 59 || second > 59) {
+        return false;
+    }
+    value = {};
+    value.wYear = static_cast<WORD>(year);
+    value.wMonth = static_cast<WORD>(month);
+    value.wDay = static_cast<WORD>(day);
+    value.wHour = static_cast<WORD>(hour);
+    value.wMinute = static_cast<WORD>(minute);
+    value.wSecond = static_cast<WORD>(second);
+    return true;
+}
+
+bool ReadHistoryEntry(const std::filesystem::path& path,
+                      HistoryEntry& entry, std::string& error)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        error = "无法读取历史报告";
+        return false;
+    }
+
+    entry.path = path;
+    entry.gameName = WideToUtf8(path.stem().wstring());
+    entry.processName = "N/A";
+    entry.startTime = "N/A";
+    entry.duration = "N/A";
+    entry.averageFps = "N/A";
+    bool inStatistics = false;
+    std::string line;
+    size_t inspectedLines = 0;
+    while (inspectedLines++ < 96 && std::getline(file, line)) {
+        NormalizeCsvLine(line);
+        if (line == "指标统计") {
+            inStatistics = true;
+            continue;
+        }
+        if (line == "逐秒样本")
+            break;
+        const std::vector<std::string> fields = ParseCsvRow(line);
+        if (fields.size() < 2)
+            continue;
+        if (fields[0] == "游戏名称")
+            entry.gameName = fields[1];
+        else if (fields[0] == "游戏进程")
+            entry.processName = fields[1];
+        else if (fields[0] == "开始时间")
+            entry.startTime = fields[1];
+        else if (fields[0] == "游戏时长")
+            entry.duration = fields[1];
+        else if (inStatistics && fields[0] == "FPS")
+            entry.averageFps = fields[1];
+    }
+    return true;
+}
+
+std::vector<HistoryEntry> ScanHistoryEntries(std::string& error)
+{
+    struct Candidate {
+        std::filesystem::path path;
+        std::filesystem::file_time_type modifiedTime = {};
+        uintmax_t sizeBytes = 0;
+    };
+
+    std::vector<Candidate> candidates;
+    std::error_code fileError;
+    const std::filesystem::path directory = ReportDirectory();
+    if (!std::filesystem::exists(directory, fileError))
+        return {};
+    if (fileError) {
+        error = "无法访问历史报告目录：" + fileError.message();
+        return {};
+    }
+
+    for (std::filesystem::directory_iterator iterator(directory, fileError), end;
+         !fileError && iterator != end; iterator.increment(fileError)) {
+        const std::filesystem::directory_entry& item = *iterator;
+        std::error_code itemError;
+        if (!item.is_regular_file(itemError) || itemError)
+            continue;
+        const std::wstring extension = item.path().extension().wstring();
+        if (_wcsicmp(extension.c_str(), L".csv") != 0)
+            continue;
+        Candidate candidate;
+        candidate.path = item.path();
+        candidate.modifiedTime = item.last_write_time(itemError);
+        if (itemError)
+            candidate.modifiedTime = {};
+        itemError.clear();
+        candidate.sizeBytes = item.file_size(itemError);
+        if (itemError)
+            candidate.sizeBytes = 0;
+        candidates.push_back(std::move(candidate));
+    }
+    if (fileError) {
+        error = "扫描历史报告失败：" + fileError.message();
+        return {};
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& left, const Candidate& right) {
+                  return left.modifiedTime > right.modifiedTime;
+              });
+    if (candidates.size() > kMaxHistoryEntries)
+        candidates.resize(kMaxHistoryEntries);
+
+    std::vector<HistoryEntry> entries;
+    entries.reserve(candidates.size());
+    size_t invalidFiles = 0;
+    for (const Candidate& candidate : candidates) {
+        HistoryEntry entry;
+        std::string entryError;
+        if (!ReadHistoryEntry(candidate.path, entry, entryError)) {
+            ++invalidFiles;
+            continue;
+        }
+        entry.modifiedTime = candidate.modifiedTime;
+        entry.sizeBytes = candidate.sizeBytes;
+        entries.push_back(std::move(entry));
+    }
+    if (entries.empty() && invalidFiles > 0)
+        error = "历史报告文件无法读取";
+    return entries;
+}
+
+std::shared_ptr<SessionData> LoadSessionCsv(const std::filesystem::path& path,
+                                            std::string& error)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        error = "无法打开所选历史报告";
+        return {};
+    }
+
+    enum class Section { Summary, Hardware, Statistics, Samples };
+    Section section = Section::Summary;
+    auto session = std::make_shared<SessionData>();
+    session->csvPath = path;
+    std::string line;
+    while (std::getline(file, line)) {
+        NormalizeCsvLine(line);
+        if (line == "硬件信息") {
+            section = Section::Hardware;
+            continue;
+        }
+        if (line == "指标统计") {
+            section = Section::Statistics;
+            continue;
+        }
+        if (line == "逐秒样本") {
+            section = Section::Samples;
+            continue;
+        }
+
+        const std::vector<std::string> fields = ParseCsvRow(line);
+        if (fields.size() < 2)
+            continue;
+        if (section == Section::Summary) {
+            if (fields[0] == "游戏名称")
+                session->gameName = fields[1];
+            else if (fields[0] == "游戏进程")
+                session->processName = fields[1];
+            else if (fields[0] == "游戏 PID") {
+                unsigned long processId = 0;
+                if (ParseUnsignedNumber(fields[1], processId))
+                    session->processId = static_cast<DWORD>(processId);
+            } else if (fields[0] == "开始时间") {
+                ParseLocalTimeText(fields[1], session->startLocal);
+            } else if (fields[0] == "结束时间") {
+                ParseLocalTimeText(fields[1], session->endLocal);
+            } else if (fields[0] == "样本上限保护") {
+                session->sampleLimitReached = fields[1] == "已触发";
+            }
+            continue;
+        }
+        if (section == Section::Hardware) {
+            if (fields[0] == "Windows")
+                session->hardware.windowsVersion = fields[1];
+            else if (fields[0] == "CPU")
+                session->hardware.cpuName = fields[1];
+            else if (fields[0] == "GPU")
+                session->hardware.gpuName = fields[1];
+            else if (fields[0] == "总内存(GB)") {
+                double totalMemory = 0.0;
+                if (ParseNumber(fields[1], totalMemory) && totalMemory > 0.0)
+                    session->hardware.totalMemoryGb = totalMemory;
+            } else if (fields[0] == "显示器") {
+                session->hardware.displayMode = fields[1];
+            }
+            continue;
+        }
+        if (section != Section::Samples || fields[0] == "经过时间(秒)" ||
+            fields.size() < 15 || session->samples.size() >= kMaxSamples) {
+            continue;
+        }
+
+        double parsed = 0.0;
+        if (!ParseNumber(fields[0], parsed) || parsed < 0.0)
+            continue;
+        GameSessionSample sample;
+        sample.elapsedSeconds = parsed;
+        auto readFloat = [&fields](size_t index, float& output) {
+            double value = 0.0;
+            if (index >= fields.size() || !ParseNumber(fields[index], value))
+                return false;
+            output = static_cast<float>(value);
+            return IsFinite(output);
+        };
+        sample.fpsValid = readFloat(1, sample.fps) && sample.fps > 0.0f;
+        sample.cpuUsageValid = readFloat(2, sample.cpuUsage) &&
+                               sample.cpuUsage >= 0.0f && sample.cpuUsage <= 100.0f;
+        sample.cpuTemperatureValid = readFloat(3, sample.cpuTemperature) &&
+                                     ValidTemperature(sample.cpuTemperature);
+        sample.cpuPackagePowerValid = readFloat(4, sample.cpuPackagePower) &&
+                                      ValidPower(sample.cpuPackagePower);
+        sample.gpuUsageValid = readFloat(5, sample.gpuUsage) &&
+                               sample.gpuUsage >= 0.0f && sample.gpuUsage <= 100.0f;
+        sample.gpuTemperatureValid = readFloat(6, sample.gpuTemperature) &&
+                                     ValidTemperature(sample.gpuTemperature);
+        sample.gpuPowerValid = readFloat(7, sample.gpuPower) &&
+                               ValidPower(sample.gpuPower);
+        sample.ramUsagePercentValid = readFloat(8, sample.ramUsagePercent) &&
+                                      sample.ramUsagePercent >= 0.0f &&
+                                      sample.ramUsagePercent <= 100.0f;
+        sample.ramUsedGbValid = readFloat(9, sample.ramUsedGb) && sample.ramUsedGb >= 0.0f;
+        sample.vramUsagePercentValid = readFloat(10, sample.vramUsagePercent) &&
+                                       sample.vramUsagePercent >= 0.0f &&
+                                       sample.vramUsagePercent <= 100.0f;
+        sample.vramUsedGbValid = readFloat(11, sample.vramUsedGb) && sample.vramUsedGb >= 0.0f;
+        sample.systemPowerValid = readFloat(12, sample.systemPower) &&
+                                  ValidPower(sample.systemPower);
+        sample.systemPowerEstimated = sample.systemPowerValid && fields[13] == "1";
+        unsigned long confidence = 0;
+        if (sample.systemPowerValid && ParseUnsignedNumber(fields[14], confidence))
+            sample.powerConfidence = std::clamp(static_cast<int>(confidence), 0, 100);
+        session->samples.push_back(sample);
+    }
+
+    if (session->samples.empty()) {
+        error = "历史报告没有可用的逐秒样本";
+        return {};
+    }
+    if (session->processName.empty())
+        session->processName = WideToUtf8(path.stem().wstring());
+    if (session->gameName.empty())
+        session->gameName = session->processName;
+    session->durationSeconds = session->samples.back().elapsedSeconds;
+    CalculateSessionStatistics(*session);
+    return session;
+}
+
 const MetricStatistics& Stats(const SessionData& session, MetricId metric)
 {
     return session.statistics[static_cast<size_t>(metric)];
@@ -946,6 +1297,20 @@ struct GameSessionReportFeature::Impl {
     std::string lastWriterError;
     std::filesystem::path lastWrittenPath;
 
+    mutable std::mutex historyMutex;
+    std::condition_variable historyCondition;
+    std::vector<HistoryEntry> historyEntries;
+    std::shared_ptr<const SessionData> selectedHistorySession;
+    std::filesystem::path selectedHistoryPath;
+    std::filesystem::path pendingHistoryLoad;
+    std::thread historyThread;
+    bool historyStarted = false;
+    bool stopHistory = false;
+    bool historyRefreshRequested = false;
+    bool historyBusy = false;
+    uint64_t historyGeneration = 0;
+    std::string historyError;
+
     void StartHardwareQuery()
     {
         if (!initialized || hardwareStarted)
@@ -970,6 +1335,145 @@ struct GameSessionReportFeature::Impl {
     {
         std::lock_guard<std::mutex> lock(hardwareMutex);
         return hardwareInfo;
+    }
+
+    void HistoryWorkerLoop()
+    {
+        for (;;) {
+            bool refresh = false;
+            bool selectedLoaded = false;
+            uint64_t requestGeneration = 0;
+            std::filesystem::path requestedLoad;
+            std::filesystem::path selectedPathSnapshot;
+            {
+                std::unique_lock<std::mutex> lock(historyMutex);
+                historyCondition.wait(lock, [this]() {
+                    return stopHistory || historyRefreshRequested ||
+                           !pendingHistoryLoad.empty();
+                });
+                if (stopHistory)
+                    break;
+                refresh = historyRefreshRequested;
+                historyRefreshRequested = false;
+                requestedLoad = std::move(pendingHistoryLoad);
+                pendingHistoryLoad.clear();
+                selectedPathSnapshot = selectedHistoryPath;
+                selectedLoaded = selectedHistorySession != nullptr;
+                requestGeneration = historyGeneration;
+                historyBusy = true;
+            }
+
+            std::vector<HistoryEntry> scannedEntries;
+            std::string scanError;
+            bool clearSelection = false;
+            if (refresh) {
+                scannedEntries = ScanHistoryEntries(scanError);
+                const bool selectionStillExists =
+                    !selectedPathSnapshot.empty() &&
+                    std::any_of(scannedEntries.begin(), scannedEntries.end(),
+                                [&selectedPathSnapshot](const HistoryEntry& entry) {
+                                    return entry.path == selectedPathSnapshot;
+                                });
+                if (!selectionStillExists) {
+                    clearSelection = true;
+                    if (requestedLoad.empty() && !scannedEntries.empty())
+                        requestedLoad = scannedEntries.front().path;
+                } else if (!selectedLoaded && requestedLoad.empty()) {
+                    requestedLoad = selectedPathSnapshot;
+                }
+            }
+
+            std::shared_ptr<SessionData> loadedSession;
+            std::string loadError;
+            if (!requestedLoad.empty())
+                loadedSession = LoadSessionCsv(requestedLoad, loadError);
+
+            {
+                std::lock_guard<std::mutex> lock(historyMutex);
+                if (refresh)
+                    historyEntries = std::move(scannedEntries);
+                if (requestGeneration == historyGeneration) {
+                    if (clearSelection && !loadedSession) {
+                        selectedHistorySession.reset();
+                        selectedHistoryPath.clear();
+                    }
+                    if (loadedSession) {
+                        selectedHistorySession = std::move(loadedSession);
+                        selectedHistoryPath = requestedLoad;
+                    }
+                    historyError = !loadError.empty() ? loadError : scanError;
+                } else if (!scanError.empty()) {
+                    historyError = scanError;
+                }
+                historyBusy = historyRefreshRequested || !pendingHistoryLoad.empty();
+            }
+        }
+    }
+
+    void StartHistoryWorker()
+    {
+        if (historyStarted)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(historyMutex);
+            stopHistory = false;
+            historyRefreshRequested = true;
+            historyBusy = true;
+            historyError.clear();
+        }
+        try {
+            historyThread = std::thread([this]() { HistoryWorkerLoop(); });
+            historyStarted = true;
+        } catch (const std::exception& exception) {
+            std::lock_guard<std::mutex> lock(historyMutex);
+            historyBusy = false;
+            historyError = std::string("无法启动历史记录线程：") + exception.what();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(historyMutex);
+            historyBusy = false;
+            historyError = "无法启动历史记录线程";
+        }
+    }
+
+    void QueueHistoryRefresh()
+    {
+        std::lock_guard<std::mutex> lock(historyMutex);
+        if (!historyStarted || stopHistory)
+            return;
+        historyRefreshRequested = true;
+        historyBusy = true;
+        historyError.clear();
+        historyCondition.notify_one();
+    }
+
+    void QueueHistoryLoad(const std::filesystem::path& path)
+    {
+        if (path.empty())
+            return;
+        std::lock_guard<std::mutex> lock(historyMutex);
+        if (!historyStarted || stopHistory)
+            return;
+        ++historyGeneration;
+        pendingHistoryLoad = path;
+        historyBusy = true;
+        historyError.clear();
+        historyCondition.notify_one();
+    }
+
+    void SelectCurrentSession()
+    {
+        std::lock_guard<std::mutex> lock(historyMutex);
+        selectedHistorySession.reset();
+        selectedHistoryPath.clear();
+        pendingHistoryLoad.clear();
+        ++historyGeneration;
+        historyError.clear();
+    }
+
+    bool HasHistory() const
+    {
+        std::lock_guard<std::mutex> lock(historyMutex);
+        return !historyEntries.empty() || selectedHistorySession != nullptr;
     }
 
     void ResetCandidate()
@@ -1133,13 +1637,17 @@ struct GameSessionReportFeature::Impl {
                     } catch (...) {
                         error = "保存报告时发生未知异常";
                     }
-                    std::lock_guard<std::mutex> statusLock(writerStatusMutex);
-                    if (success) {
-                        lastWrittenPath = job.session->csvPath;
-                        lastWriterError.clear();
-                    } else {
-                        lastWriterError = error.empty() ? "保存报告失败" : error;
+                    {
+                        std::lock_guard<std::mutex> statusLock(writerStatusMutex);
+                        if (success) {
+                            lastWrittenPath = job.session->csvPath;
+                            lastWriterError.clear();
+                        } else {
+                            lastWriterError = error.empty() ? "保存报告失败" : error;
+                        }
                     }
+                    if (success)
+                        QueueHistoryRefresh();
                 }
             });
             writerStarted = true;
@@ -1193,6 +1701,7 @@ struct GameSessionReportFeature::Impl {
         session.csvPath = BuildCsvPath(session);
         auto completed = std::shared_ptr<SessionData>(std::move(activeSession));
         lastCompletedSession = completed;
+        SelectCurrentSession();
         if (saveCsv && !completed->samples.empty())
             QueueCsv(completed);
         if (allowOpenRequest && autoOpen &&
@@ -1299,6 +1808,14 @@ struct GameSessionReportFeature::Impl {
         }
         if (writerThread.joinable())
             writerThread.join();
+        {
+            std::lock_guard<std::mutex> lock(historyMutex);
+            stopHistory = true;
+            historyCondition.notify_all();
+        }
+        if (historyThread.joinable())
+            historyThread.join();
+        historyStarted = false;
     }
 
 #if defined(FPSOVERLAY_UI_QA)
@@ -1442,9 +1959,22 @@ struct GameSessionReportFeature::Impl {
         const bool validBom = file.gcount() == static_cast<std::streamsize>(sizeof(bom)) &&
                               bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF;
         file.close();
+        std::string loadError;
+        const std::shared_ptr<SessionData> loaded =
+            LoadSessionCsv(session->csvPath, loadError);
+        HistoryEntry historyEntry;
+        std::string entryReadError;
+        const bool historyEntryValid =
+            ReadHistoryEntry(session->csvPath, historyEntry, entryReadError);
         std::error_code removeError;
         std::filesystem::remove(session->csvPath, removeError);
-        return validBom && test.lastWriterError.empty() && !removeError;
+        return validBom && test.lastWriterError.empty() && loaded &&
+               loaded->gameName == session->gameName &&
+               loaded->processName == session->processName &&
+               loaded->samples.size() == session->samples.size() &&
+               historyEntryValid && historyEntry.gameName == session->gameName &&
+               historyEntry.processName == session->processName &&
+               loadError.empty() && entryReadError.empty() && !removeError;
     }
 #endif
 };
@@ -1513,6 +2043,7 @@ void GameSessionReportFeature::Init()
         std::terminate();
 #endif
     impl_->initialized = true;
+    impl_->StartHistoryWorker();
     if (impl_->enabled)
         impl_->StartHardwareQuery();
 }
@@ -1545,6 +2076,8 @@ bool GameSessionReportFeature::DrawSettings(FeatureContext&)
     } else if (impl_->lastCompletedSession) {
         SettingsUi::Status("最近报告：",
                            impl_->lastCompletedSession->processName.c_str(), true);
+    } else if (impl_->HasHistory()) {
+        SettingsUi::Status("历史报告：", "已找到本地记录", true);
     } else {
         SettingsUi::Status("最近报告：", "暂无记录", false);
     }
@@ -1577,10 +2110,94 @@ bool GameSessionReportFeature::DrawReportPage(FeatureContext&)
     }
     SettingsUi::EndCard();
 
-    const std::shared_ptr<const SessionData> report = impl_->lastCompletedSession;
+    std::vector<HistoryEntry> historyEntries;
+    std::shared_ptr<const SessionData> historyReport;
+    std::filesystem::path selectedHistoryPath;
+    std::string historyError;
+    bool historyBusy = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->historyMutex);
+        historyEntries = impl_->historyEntries;
+        historyReport = impl_->selectedHistorySession;
+        selectedHistoryPath = impl_->selectedHistoryPath;
+        historyError = impl_->historyError;
+        historyBusy = impl_->historyBusy;
+    }
+
+    if (SettingsUi::BeginCard("##game_report_history", "历史记录",
+                              "最近 100 份本地 CSV")) {
+        ImGui::BeginDisabled(historyBusy);
+        if (ImGui::Button("刷新记录"))
+            impl_->QueueHistoryRefresh();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("打开记录文件夹##history")) {
+            const std::filesystem::path folder = ReportDirectory();
+            std::error_code directoryError;
+            std::filesystem::create_directories(folder, directoryError);
+            ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr,
+                          SW_SHOWNORMAL);
+        }
+        if (impl_->lastCompletedSession && !selectedHistoryPath.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("查看本次最近报告"))
+                impl_->SelectCurrentSession();
+        }
+
+        if (historyBusy)
+            SettingsUi::Muted("正在读取历史记录…");
+        if (!historyError.empty())
+            ImGui::TextColored(SettingsUi::Warning(), "%s", historyError.c_str());
+
+        if (historyEntries.empty()) {
+            SettingsUi::MutedWrapped("暂无已保存的游戏报告。新会话结束并成功保存 CSV 后会自动出现在这里。");
+        } else if (ImGui::BeginTable(
+                       "##game_report_history_table", 5,
+                       ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
+                           ImGuiTableFlags_SizingStretchProp |
+                           ImGuiTableFlags_ScrollY,
+                       ImVec2(0.0f, 230.0f))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("游戏", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+            ImGui::TableSetupColumn("开始时间", ImGuiTableColumnFlags_WidthStretch, 1.7f);
+            ImGui::TableSetupColumn("时长", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("平均 FPS", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+            ImGui::TableSetupColumn("操作", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+            ImGui::TableHeadersRow();
+            for (const HistoryEntry& entry : historyEntries) {
+                const std::string pathId = WideToUtf8(entry.path.wstring());
+                const bool selected = entry.path == selectedHistoryPath &&
+                                      historyReport != nullptr;
+                ImGui::PushID(pathId.c_str());
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.gameName.c_str());
+                SettingsUi::Muted("%s", entry.processName.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.startTime.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.duration.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(entry.averageFps.c_str());
+                ImGui::TableNextColumn();
+                ImGui::BeginDisabled(selected || historyBusy);
+                if (ImGui::Button(selected ? "查看中" : "查看"))
+                    impl_->QueueHistoryLoad(entry.path);
+                ImGui::EndDisabled();
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    SettingsUi::EndCard();
+
+    const std::shared_ptr<const SessionData> report =
+        historyReport ? historyReport : impl_->lastCompletedSession;
     if (!report) {
         if (SettingsUi::BeginCard("##game_report_empty", "暂无游戏报告")) {
-            SettingsUi::MutedWrapped("识别到稳定游戏目标 2 秒后开始记录。游戏结束或目标连续丢失 5 秒后生成报告；不足 30 秒的会话不会自动弹出。");
+            SettingsUi::MutedWrapped(historyBusy
+                ? "正在后台读取最新的历史报告。"
+                : "识别到稳定游戏目标 2 秒后开始记录。游戏结束或目标连续丢失 5 秒后生成报告；不足 30 秒的会话不会自动弹出。");
         }
         SettingsUi::EndCard();
         return changed;
@@ -1720,7 +2337,7 @@ bool GameSessionReportFeature::ConsumeOpenRequest()
 
 bool GameSessionReportFeature::HasCompletedSession() const
 {
-    return impl_->lastCompletedSession != nullptr;
+    return impl_->lastCompletedSession != nullptr || impl_->HasHistory();
 }
 
 bool GameSessionReportFeature::NeedsSensorPolling() const
