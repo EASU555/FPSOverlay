@@ -2584,7 +2584,7 @@ static bool IsKnownDesktopProcess(const char* exeName)
         "krsdkexternal.exe", "crashreportclient.exe",
         "unrealcefsubprocess.exe", "cefsharp.browsersubprocess.exe",
         "clash-verge.exe", "clash-verge-service.exe", "baidunetdisk.exe",
-        "leigod.exe", "ace-tray.exe", "ace-service.exe",
+        "leigod.exe", "ace-tray.exe", "ace-service.exe", "ace-helper.exe",
         "gameguard.des", "gameguard.exe", "gamemon.des", "gamemon64.des",
         "easyanticheat.exe", "easyanticheat_eos.exe",
         "beservice.exe", "beservice_x64.exe", "start_protected_game.exe",
@@ -9170,6 +9170,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
             g_Config.layoutStyle, g_Config.overlayScale);
 #if defined(FPSOVERLAY_UI_QA)
     if (!IsKnownDesktopProcess("GameGuard.des (nProtect GameGuard Launcher)") ||
+        !IsKnownDesktopProcess("ACE-Helper.exe") ||
         !IsKnownDesktopProcess("EasyAntiCheat_EOS.exe") ||
         IsKnownDesktopProcess("helldivers2.exe (HELLDIVERS 2)")) {
         std::terminate();

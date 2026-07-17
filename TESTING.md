@@ -1043,5 +1043,18 @@
 - [x] Windows `FileVersion`、`ProductVersion` 和 Release/QA manifest 同步为 v1.10.47；Release 为 `requireAdministrator`，QA 为 `asInvoker`。
 - [x] Windows ZIP 只包含 `overlay.exe`、`lhwm-wrapper.dll` 和 `LibreHardwareMonitorLib.dll`；源码 ZIP 包含 124 个 Git 跟踪文件，不包含构建产物、日志、配置和历史报告。
 - [x] 与修改前归档比较，游戏加加主绘制块、指标顺序和绘制样式无修改。
-- [ ] 用户在真实游戏、普通最大化应用和休眠唤醒场景复测目标识别与退出时延。
+- [x] 用户完成真实游戏与休眠唤醒复测：同一 v1.10.47 进程跨越约 12 小时 49 分钟休眠后继续写日志，托盘恢复、LHWM 延迟恢复和新鲜硬件快照均成功。
 - [x] Codex 未启动 v1.10.47 正式发布程序。
+
+## v1.10.48 ACE 辅助进程误记录修复
+
+- [x] 修改前已归档 v1.10.47 到 `旧版本归档\2026-07-17_1340_v1.10.47_ACE辅助进程误记录修复前`。
+- [x] 复核实测 `20260717-131210_ACE-Helper.exe.csv`：会话仅 5.219 秒、4 个样本、有效 FPS 样本为 0，确认属于反作弊辅助进程误记录。
+- [x] 复核正式游戏 `20260717-131222_SilverStarGameWeGame.exe.csv`：20 分 57 秒、1254 个逐秒样本、功耗覆盖率 100.0%、估算耗电量 0.068968 度。
+- [x] `ACE-Helper.exe` 已进入 `IsKnownDesktopProcess()` 排除表，FeatureContext 会将其标记为不允许启动游戏会话。
+- [x] QA 启动断言覆盖 `ACE-Helper.exe`、GameGuard、EasyAntiCheat 和真实游戏名称的正反分类。
+- [x] `FPSOVERLAY_UI_QA` v1.10.48 以 `/W4 /permissive- /Zi` 无警告编译通过；运行 4 秒保持响应，内置自检通过并以代码 0 退出。
+- [x] Release x64 资源编译、C++ 编译、链接和 LTCG 以 `/W4 /permissive- /Zi` 无警告通过。
+- [x] Windows `FileVersion` 为 `1.10.48.0`，`ProductVersion` 为 `v1.10.48 (2026-07-17 13:41)`。
+- [x] 发布目录根部 `overlay.exe`、版本化 EXE 和 Windows ZIP 已同步；Codex 未启动正式发布程序。
+- [x] 源码差异未触及会话统计、功耗积分、历史解析或任何 Overlay 绘制路径。
