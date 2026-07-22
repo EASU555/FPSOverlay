@@ -2613,6 +2613,7 @@ static bool HasStrongGameIdentity(const char* exeName, const char* imagePath)
         exe.find("-win32-shipping.exe") != std::string::npos ||
         exe.find("deltaforceclient") != std::string::npos ||
         exe.find("deltaforce") != std::string::npos ||
+        ExecutableNameEquals(exeName, "shadPS4.exe") ||
         exe.find("3dmark") != std::string::npos) {
         return true;
     }
@@ -7714,6 +7715,8 @@ static void UpdateOverlayHostWindow(bool gameMonitor, HWND foreground,
     static ULONGLONG s_lastPlacementTick = 0;
     static RECT s_lastAppliedRect = {};
     static bool s_lastGameMonitor = false;
+    static DWORD s_lastTargetPid = 0;
+    static HWND s_lastGameWindow = nullptr;
 
     const ULONGLONG now = GetTickCount64();
     if (!force && now - s_lastPlacementTick < (gameMonitor ? 16ULL : 1500ULL))
@@ -7733,16 +7736,40 @@ static void UpdateOverlayHostWindow(bool gameMonitor, HWND foreground,
         !ResolveOverlayHostRect(gameMonitor, foreground, targetPid, &host))
         return;
 
+    const bool targetWindowChanged =
+        gameMonitor &&
+        (targetPid != s_lastTargetPid || gameWindow != s_lastGameWindow);
     const bool changed =
         force || gameMonitor != s_lastGameMonitor ||
-        !RectEquals(host, s_lastAppliedRect);
+        !RectEquals(host, s_lastAppliedRect) || targetWindowChanged;
     const int width = host.right - host.left;
     const int height = host.bottom - host.top;
     if (width <= 0 || height <= 0)
         return;
 
-    SetWindowPos(g_hwnd, HWND_TOPMOST, host.left, host.top, width, height,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+    // A borderless Vulkan host can replace its top-level HWND without moving to
+    // another monitor. Pulse the topmost state once for the new HWND so DWM
+    // recomposes the external overlay above the replacement presentation window.
+    if (targetWindowChanged) {
+        if (!SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                              SWP_NOOWNERZORDER)) {
+            LogLine("Overlay host topmost reset failed: target=%lu targetWindow=%p err=%lu",
+                    (unsigned long)targetPid, gameWindow,
+                    (unsigned long)GetLastError());
+        }
+    }
+
+    const UINT placementFlags =
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER |
+        (changed ? SWP_FRAMECHANGED : 0);
+    if (!SetWindowPos(g_hwnd, HWND_TOPMOST, host.left, host.top, width, height,
+                      placementFlags)) {
+        LogLine("Overlay host placement failed: target=%lu targetWindow=%p err=%lu",
+                (unsigned long)targetPid, gameWindow,
+                (unsigned long)GetLastError());
+        return;
+    }
 
     if (changed) {
         LogLine("Overlay host updated: gameMonitor=%d rect=%ld,%ld,%ld,%ld target=%lu targetWindow=%p owner=%p reason=%s",
@@ -7756,6 +7783,8 @@ static void UpdateOverlayHostWindow(bool gameMonitor, HWND foreground,
 
     s_lastAppliedRect = host;
     s_lastGameMonitor = gameMonitor;
+    s_lastTargetPid = gameMonitor ? targetPid : 0;
+    s_lastGameWindow = gameMonitor ? gameWindow : nullptr;
     g_OverlayHostRect = host;
     g_OverlayUsingGameMonitor = gameMonitor;
 }
@@ -9172,7 +9201,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR commandLine, int)
     if (!IsKnownDesktopProcess("GameGuard.des (nProtect GameGuard Launcher)") ||
         !IsKnownDesktopProcess("ACE-Helper.exe") ||
         !IsKnownDesktopProcess("EasyAntiCheat_EOS.exe") ||
-        IsKnownDesktopProcess("helldivers2.exe (HELLDIVERS 2)")) {
+        IsKnownDesktopProcess("helldivers2.exe (HELLDIVERS 2)") ||
+        !HasStrongGameIdentity("shadPS4.exe", "C:\\Emulators\\shadPS4.exe")) {
         std::terminate();
     }
 #endif

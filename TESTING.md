@@ -1058,3 +1058,18 @@
 - [x] Windows `FileVersion` 为 `1.10.48.0`，`ProductVersion` 为 `v1.10.48 (2026-07-17 13:41)`。
 - [x] 发布目录根部 `overlay.exe`、版本化 EXE 和 Windows ZIP 已同步；Codex 未启动正式发布程序。
 - [x] 源码差异未触及会话统计、功耗积分、历史解析或任何 Overlay 绘制路径。
+
+## v1.10.49 shadPS4 无边框全屏显示修复
+
+- [x] 修改前已归档 v1.10.48 到 `旧版本归档\2026-07-22_1856_v1.10.48_shadPS4无边框Overlay修复前`。
+- [x] 复核 2026-07-22 18:43、18:46 实测日志：`shadPS4.exe` 启动后先进入“no foreground game rendering detected”，后续 ETW 达到约 120 FPS 才锁定目标。
+- [x] 复核报告 `20260722-184342_shadPS4.exe.csv` 和 `20260722-184649_shadPS4.exe.csv`，确认 FPS 采样与会话结束正常，故障不在 ETW 或报告 Feature。
+- [x] 复核本机 shadPS4 配置为 `Fullscreen (Borderless)`、2560×1600 和 Vulkan `Immediate`，排除误用独占全屏配置。
+- [x] QA 启动断言确认 `shadPS4.exe` 属于强游戏身份，GameGuard、ACE Helper 和 EasyAntiCheat 仍保持排除。
+- [x] 静态检查确认 Overlay 宿主变化现包含 PID/HWND，新 Vulkan 窗口会执行一次 `HWND_NOTOPMOST` 到 `HWND_TOPMOST` 的不激活切换。
+- [x] `SetWindowPos` 两个失败路径都记录目标 PID、HWND 和 `GetLastError()`，失败不导致程序崩溃。
+- [x] Release x64 和 `FPSOVERLAY_UI_QA` v1.10.49 均以 `/W4 /permissive- /Zi` 无警告编译通过。
+- [x] QA 实际运行 4 秒保持响应，内置分类断言通过，并通过托盘退出命令以代码 0 结束。
+- [ ] 用户使用 v1.10.49 重测 shadPS4 启动、Vulkan 无边框全屏和退出，确认 Overlay 从游戏启动阶段就保持在最上层。
+- [ ] 用户同时复测普通游戏、普通应用最大化和休眠唤醒，确认无回归。
+- [x] 本次没有启动 v1.10.49 正式 Release，没有修改任何 Overlay 指标顺序或绘制样式。
